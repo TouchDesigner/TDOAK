@@ -9,7 +9,8 @@ description = "TouchDesigner OAK camera integration"
 readme = "README.md"
 requires-python = ">= 3.12"
 dependencies = [
-    "depthai",
+    "depthai>=3.6.1",
+    "depthai-nodes",  # ParsingNeuralNetwork + parsers for Model Zoo NNs (pose_pipeline)
     "numpy",
 ]
 

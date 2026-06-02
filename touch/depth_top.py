@@ -1,13 +1,20 @@
-# depth Script TOP — cook callback
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
 
+if TYPE_CHECKING:
+    from td import scriptTOP
 
-def cook(scriptOp):
+
+def cook(scriptOp: scriptTOP) -> None:
     ext   = op('..').ext.OAKManagerExt
-    frame = ext.GetDepth()
+    frame = ext.GetFrame('depth')
     if frame is None:
         return
 
-    # uint16 mm values — pass raw for downstream Level TOP / GLSL processing.
-    # To normalise: frame / 10000.0 maps 0–10 m → 0.0–1.0 float.
-    scriptOp.copyNumpyArray(frame[:, :, np.newaxis])
+    h, w  = frame.shape
+    out   = np.empty((h, w, 1), dtype=np.uint16)
+    out[:, :, 0] = frame
+    scriptOp.copyNumpyArray(out)

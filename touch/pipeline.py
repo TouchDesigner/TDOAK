@@ -1,49 +1,55 @@
-# pipeline.py — edit this to define your OAK pipeline
-# Drop this text into the pipeline.py Text DAT inside the OAK Base COMP.
-import depthai as dai
+from __future__ import annotations
+
+# pipeline.py — default OAK pipeline with synced RGB + depth (depthai v3)
+# Load into the Pipeline DAT parameter of the OAK component.
+# build(pipeline) must return ({name: out_queue}, [stream_names], {name: in_queue})
+
+from datetime import timedelta
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import depthai as dai
+
+SYNC_THRESHOLD_MS = 50
 
 
-def build(pipeline):
-    """
-    Define your DepthAI node graph here.
-    Return a list of XLinkOut stream names — these tell the extension
-    which device queues to open on the host side.
-    """
+def build(pipeline: dai.Pipeline) -> tuple[
+    dict[str, dai.DataOutputQueue],
+    list[str],
+    dict[str, dai.InputQueue],
+]:
+    import depthai as dai
 
-    # ── Color camera ─────────────────────────────────────────────────────
-    cam = pipeline.create(dai.node.ColorCamera)
-    cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-    cam.setInterleaved(False)
-    cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
-    cam.setFps(30)
+    # ── RGB camera ────────────────────────────────────────────────────────
+    cam     = pipeline.create(dai.node.Camera).build()
+    rgb_out = cam.requestOutput((1920, 1080), type=dai.ImgFrame.Type.BGR888p)
 
-    # ── Stereo depth ─────────────────────────────────────────────────────
-    left  = pipeline.create(dai.node.MonoCamera)
-    right = pipeline.create(dai.node.MonoCamera)
-    left.setBoardSocket(dai.CameraBoardSocket.CAM_B)
-    right.setBoardSocket(dai.CameraBoardSocket.CAM_C)
-    left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-    right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-
+    # ── Stereo depth ──────────────────────────────────────────────────────
+    left  = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
+    right = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
     stereo = pipeline.create(dai.node.StereoDepth)
-    stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetType.HIGH_DENSITY)
+    stereo.setRectification(True)
     stereo.setLeftRightCheck(True)
-    left.out.link(stereo.left)
-    right.out.link(stereo.right)
+    left.requestFullResolutionOutput().link(stereo.left)
+    right.requestFullResolutionOutput().link(stereo.right)
 
-    # ── Optional: neural network ─────────────────────────────────────────
-    # nn = pipeline.create(dai.node.MobileNetDetectionNetwork)
-    # nn.setConfidenceThreshold(0.5)
-    # nn.setBlobPath('/path/to/model.blob')
-    # cam.preview.link(nn.input)
+    # ── Sync + demux ──────────────────────────────────────────────────────
+    sync = pipeline.create(dai.node.Sync)
+    sync.setSyncThreshold(timedelta(milliseconds=SYNC_THRESHOLD_MS))
+    rgb_out.link(sync.inputs['rgb'])
+    stereo.depth.link(sync.inputs['depth'])
 
-    # ── XLinkOut nodes ────────────────────────────────────────────────────
-    xout_rgb = pipeline.create(dai.node.XLinkOut)
-    xout_rgb.setStreamName('rgb')
-    cam.video.link(xout_rgb.input)
+    demux = pipeline.create(dai.node.MessageDemux)
+    sync.out.link(demux.input)
 
-    xout_depth = pipeline.create(dai.node.XLinkOut)
-    xout_depth.setStreamName('depth')
-    stereo.depth.link(xout_depth.input)
+    queues: dict[str, dai.DataOutputQueue] = {
+        'rgb':   demux.outputs['rgb'].createOutputQueue(),
+        'depth': demux.outputs['depth'].createOutputQueue(),
+    }
 
-    return ['rgb', 'depth']
+    controls: dict[str, dai.InputQueue] = {
+        'cam_ctrl':   cam.inputControl.createInputQueue(maxSize=1, blocking=False),
+        'stereo_cfg': stereo.inputConfig.createInputQueue(maxSize=1, blocking=False),
+    }
+
+    return queues, ['rgb', 'depth'], controls
