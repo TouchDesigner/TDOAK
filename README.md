@@ -109,9 +109,13 @@ Frames are written by the background pump thread and read-locked for safe access
 Return the latest frame for the given stream name, or `None` if no frame has arrived yet.
 
 `FrameData` is one of:
-- `numpy.ndarray` — image or point-cloud data (see format notes below)
-- `list[DetectionEntry]` — NN object-detection results
-- `list[PoseEntry]` — NN pose / skeleton results
+- `numpy.ndarray` — image, mask, or point-cloud data (see format notes below)
+- `list[DetectionEntry]` — NN object-detection results (`dai.ImgDetections`)
+- `list[PoseEntry]` — NN pose / skeleton results (`dai.ImgDetections` with keypoints)
+- `list[ExtendedDetectionEntry]` — depthai-nodes `ImgDetectionsExtended` (rotated box + keypoints)
+- `list[ClassificationEntry]` — depthai-nodes `Classifications`
+- `list[list[float]]` — keypoints `[[x, y, score], …]` or lines `[[x1, y1, x2, y2, conf], …]`
+- `list[list[list[float]]]` — clusters `[[[x, y], …], …]`
 - `ImuData` — accelerometer + gyroscope packet
 - any value returned by a custom Handler `parse` (see [Script OP Integration](#script-op-integration))
 
@@ -139,11 +143,14 @@ oak.GetPose()     # → list[PoseEntry], or None
 | `color` | `uint8` | `(H, W, 3)` | BGR, aligned to ToF depth perspective |
 | `ir_left` / `ir_right` | `uint8` | `(H, W)` | Rectified infrared frames |
 | `pointcloud` | `float32` | `(H, W, 3)` | Organized XYZ in mm (R=X, G=Y, B=Z) — drops into a 32-bit float TOP |
+| `segmentation` | `uint16` | `(H, W)` | depthai-nodes `SegmentationMask` class indices (background → 0), flipped to TD convention — drops into a TOP |
 | `imu` | — | — | `ImuData` dict, not an ndarray |
 | `detections` | — | — | `list[DetectionEntry]`, not an ndarray |
 | `pose` | — | — | `list[PoseEntry]`, not an ndarray |
 
 > The `depth` stream is `uint16` millimetres for the stereo and ToF pipelines, but `float32` **relative** inverse depth (`[0,1]`, larger = nearer) for `mono_depth_pipeline.py`, since that comes from a neural `Map2D` rather than a metric sensor.
+
+> Stream names above are conventions, not requirements — `GetFrame(name)` keys off whatever names your pipeline's `build()` returns. The dtype/shape is determined by the decoded message type, not the name.
 
 **`DetectionEntry` fields:**
 
@@ -161,6 +168,27 @@ oak.GetPose()     # → list[PoseEntry], or None
 | `box` | `list[float]` | `[xmin, ymin, xmax, ymax]`, normalised 0–1 |
 | `keypoints` | `list[list[float]]` | Joint positions `[[x, y], …]`, normalised 0–1 (COCO-17 order for the bundled pose model) |
 | `edges` | `list[list[int]]` | Skeleton bone connections `[[i, j], …]` indexing into `keypoints` |
+
+**`ExtendedDetectionEntry` fields** (depthai-nodes `ImgDetectionsExtended`, one per detection):
+
+| Key | Type | Description |
+|---|---|---|
+| `label` | `int` | Class index |
+| `confidence` | `float` (0–1) | Detection confidence |
+| `box` | `list[float]` | Axis-aligned `[xmin, ymin, xmax, ymax]` outer bounds of the rotated box, normalised 0–1 |
+| `angle` | `float` | Rotated-box rotation in degrees (`0` for upright boxes) |
+| `keypoints` | `list[list[float]]` | `[[x, y, score], …]`, normalised 0–1; empty when the model emits none |
+
+> `ImgDetectionsExtended` may also carry a message-level segmentation mask. It isn't part of the default payload — read it in a custom `parse` if you need it.
+
+**`ClassificationEntry` fields** (depthai-nodes `Classifications`, one per class):
+
+| Key | Type | Description |
+|---|---|---|
+| `label` | `str` | Class name |
+| `score` | `float` (0–1) | Class probability |
+
+**Bare lists** — `Keypoints` → `[[x, y, score], …]`; `Lines` → `[[x1, y1, x2, y2, confidence], …]`; `Clusters` → `[[[x, y], …], …]` (all normalised 0–1).
 
 **`ImuData` fields:**
 
@@ -281,7 +309,9 @@ Stream data reaches a Script Operator in two stages, split across threads:
 1. **decode** — turn the (model-specific) depthai message into plain, thread-safe data. Runs on the **background pump thread**, so it never blocks cooking/rendering.
 2. **fill** — write that data into a Script TOP/CHOP/SOP/DAT. Runs on the **main thread**, where TD object access is legal.
 
-Built-in decoders cover `rgb`, `depth`, `amplitude`, `color`, `ir_left/right`, `pointcloud`, `detections`, `pose`, `imu`, and depthai-nodes `Map2D` maps (monocular depth / heatmaps → float32 `(H, W)`), so common streams need no code at all. For any other model, attach a per-stream **Handler DAT**.
+Built-in decoders cover images (`rgb`, `depth`, `amplitude`, `color`, `ir_left/right`), `pointcloud`, `imu`, `dai.ImgDetections` (→ `detections`/`pose`), and the depthai-nodes message family — `Map2D` (monocular depth / heatmaps → float32 `(H, W)`), `ImgDetectionsExtended`, `Keypoints`, `SegmentationMask`, `Classifications`, `Lines`, and `Clusters` — so common streams need no code at all. Decoding keys off the **message type**, not the stream name, so these work whatever you name the stream. For any other model output, attach a per-stream **Handler DAT** (its `parse` overrides the default decode).
+
+> These are zero-config defaults, not a fixed contract. A model-specific format (different keypoint order, custom tensor layout, etc.) is still handled the normal way: a Handler `parse` returns whatever structure you like and a `fill` shapes it into the Script OP.
 
 #### Per-stream Handler DAT
 
