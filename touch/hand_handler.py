@@ -1,0 +1,93 @@
+# hand_handler.py — Handler DAT for the 'hands' stream of hand_pipeline.py
+# Point a Streams block's Handler parameter at this DAT, bind its Scriptop to a Script SOP,
+# and add the onCook callback below to that SOP. `dai` and `np` are already in scope.
+#
+#   parse(msg)         BACKGROUND THREAD — depthai GatheredData -> plain per-hand data.
+#   fill(scriptOp, hands)  MAIN THREAD     — draws the 21-point skeleton into a Script SOP.
+#
+# Script SOP cook callback (paste into the bound SOP's Callbacks DAT):
+#   def onCook(scriptOp):
+#       op('OAK').ext.OAKManagerExt.FillScriptOp(scriptOp)
+
+import math
+
+# Keep equal to CROP_PADDING in hand_pipeline.py — the back-map undoes the same padding
+# the FrameCropper added around each palm rect.
+CROP_PADDING = 0.1
+
+# Standard MediaPipe 21-keypoint hand connections — used only if the model archive
+# doesn't ship its own skeleton edges (Keypoints.getEdges()).
+HAND_EDGES = [
+    (0, 1), (1, 2), (2, 3), (3, 4),          # thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),          # index
+    (5, 9), (9, 10), (10, 11), (11, 12),     # middle
+    (9, 13), (13, 14), (14, 15), (15, 16),   # ring
+    (13, 17), (17, 18), (18, 19), (19, 20),  # pinky
+    (0, 17),                                  # palm base
+]
+
+
+def _keypoints_of(item):
+    """The gathered item is a Keypoints message, or a MessageGroup wrapping one (when the
+    landmarker exposes multiple heads). Return whichever carries getPoints2f()."""
+    if hasattr(item, 'getPoints2f'):
+        return item
+    try:
+        for _key, member in item:               # MessageGroup is iterable as (name, msg)
+            if hasattr(member, 'getPoints2f'):
+                return member
+    except TypeError:
+        pass
+    return None
+
+
+def parse(msg):
+    """GatheredData -> list of hands. Each hand's landmarks come back normalized within its
+    (rotated, padded) crop; map them onto the full frame via the palm's RotatedRect so they
+    overlay the 'rgb' stream directly. items[i] corresponds to detections[i] (crop order)."""
+    detections = msg.reference_data.detections
+    hands = []
+    for det, item in zip(detections, msg.items):
+        kp = _keypoints_of(item)
+        if kp is None:
+            continue
+
+        rect = det.getBoundingBox()                      # RotatedRect, normalized
+        cx, cy = rect.center.x, rect.center.y
+        w = rect.size.width + 2 * CROP_PADDING
+        h = rect.size.height + 2 * CROP_PADDING
+        ang = math.radians(det.getAngle())
+        ca, sa = math.cos(ang), math.sin(ang)
+
+        points = []
+        for p in kp.getPoints2f():
+            lx = (p.x - 0.5) * w                         # crop-local, centered
+            ly = (p.y - 0.5) * h
+            fx = cx + lx * ca - ly * sa                  # rotate into frame space
+            fy = cy + lx * sa + ly * ca
+            points.append([fx, fy])
+
+        edges = [list(e) for e in kp.getEdges()] or [list(e) for e in HAND_EDGES]
+        hands.append({
+            'score':     round(float(det.confidence), 3),
+            'keypoints': points,
+            'edges':     edges,
+        })
+    return hands
+
+
+def fill(scriptOp, hands):
+    """Draw one polyline skeleton per hand into a Script SOP (mirrors the pose example)."""
+    scriptOp.clear()
+    if not hands:
+        return
+    for hand in hands:
+        kpts = hand['keypoints']
+        pts = [scriptOp.appendPoint() for _ in kpts]
+        for p, (x, y) in zip(pts, kpts):
+            p.x, p.y, p.z = x, 1.0 - y, 0.0              # y-flip: rgb is flipud'd for display
+        n = len(pts)
+        for i, j in hand['edges']:
+            if i < n and j < n:
+                prim = scriptOp.appendPoly(2, closed=False, addPoints=False)
+                prim[0].point, prim[1].point = pts[i], pts[j]
