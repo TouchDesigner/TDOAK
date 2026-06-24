@@ -6,6 +6,8 @@ Supports USB OAK-D (RGB + stereo depth + IMU) and OAK-D SR PoE (ToF depth + alig
 
 Stream data is decoded off the main thread and pushed into Script Operators. Common streams (rgb, depth, amplitude, detections, pose, imu…) are handled out of the box; any other model's output can be decoded and shaped with a per-stream **Handler DAT** — see [Script OP Integration](#script-op-integration).
 
+Neural models declared by a pipeline are **pre-fetched on a subprocess** before the device pipeline is built, so a Model Zoo download never freezes the UI — progress is reported live in the **Models** sequence. Custom local models (NNArchive/blob on disk) are detected and loaded directly without a download. See [Model Pre-fetch](#model-pre-fetch).
+
 ---
 
 ## Requirements
@@ -14,6 +16,7 @@ Stream data is decoded off the main thread and pushed into Script Operators. Com
 - depthai 3.6.1 installed in TD's Python environment
 - depthai-nodes (only for the bundled pose pipeline — provides `ParsingNeuralNetwork`)
 - numpy (already bundled with TD)
+- A project `.venv` (`/.venv/Scripts/python.exe`) with `depthai` installed — used by the [model pre-fetch](#model-pre-fetch) subprocess (falls back to TD's Python if absent)
 
 ---
 
@@ -37,6 +40,7 @@ The component's `Connected`, `Fps`, `Activestreams`, and `Lasterror` parameters 
 | `Stop` | Pulse | Stop the pipeline cleanly. |
 | `Rebuild` | Pulse | Stop and restart (useful after changing parameters). |
 | `List Devices` | Pulse | Enumerate all visible OAK devices and update the Device menu. |
+| `Reload Handlers` | Pulse | Hot-reload the Streams blocks' Handler DATs (`parse`/`fill`) into the **running** pipeline — applies handler/binding edits without a restart. See [Script OP Integration](#script-op-integration). |
 | `Pipeline DAT` | DAT ref | Optional custom pipeline script. See [Pipeline Scripts](#pipeline-scripts). Leave empty for the built-in auto-detect pipeline. |
 | `Auto Reload` | Toggle | When enabled, automatically rebuilds when the Pipeline DAT changes. |
 | `Enable Depth` | Toggle | Enable stereo depth output on RGB cameras (ignored for ToF devices). |
@@ -46,6 +50,7 @@ The component's `Connected`, `Fps`, `Activestreams`, and `Lasterror` parameters 
 | `Active Streams` | String (read-only) | Comma-separated list of active stream names. |
 | `Last Error` | String (read-only) | Most recent error message, or empty if no error. |
 | `Streams` (seq) | Sequential block | Bind stream names to Script Operators. Each block has a `Stream` menu, a `Scriptop` OP reference, and an optional `Handler` DAT reference (custom `parse`/`fill` — see [Script OP Integration](#script-op-integration)). |
+| `Models` (seq) | Sequential block (read-only) | Status readout, one block per model the pipeline declares. `Model` is the slug or local path; `Progress` (0–1) tracks the pre-fetch. Populated automatically on Start — see [Model Pre-fetch](#model-pre-fetch). |
 
 ---
 
@@ -67,10 +72,13 @@ All methods listed here are safe to call from the **main thread** unless otherwi
 Start the camera pipeline. Resets the retry counter to zero (so errors before this call are forgotten). If the pipeline fails, it retries up to 3 times with a 10-second delay between attempts. After 3 failures, `Lasterror` shows the final error and the pipeline stops retrying — call `Start()` again to reset.
 
 #### `Stop() -> None`
-Signal the background pump to exit cleanly. The pipeline and device are closed in the Thread Manager's success hook.
+Signal the background pump to exit cleanly. The pipeline and device are closed **on the background thread** (the pump's `finally`), not in a main-thread hook — `device.close()`/`pipeline.stop()` are blocking depthai calls, so keeping them off the main thread avoids freezing the UI for several frames on each stop or retry.
 
 #### `Rebuild() -> None`
 Stop the pipeline and restart it after 5 frames. Equivalent to `Stop()` followed by a delayed `Start()`. Triggered automatically when `Auto Reload` is on and the Pipeline DAT changes.
+
+#### `ReloadHandlers() -> None`
+Re-load the Streams blocks' Handler DATs and hot-swap their `parse`/`fill` into the **running** pipeline — no device or pipeline restart. Call after adding or editing a Streams block, its `Scriptop`, or its `Handler` DAT. The worker reads the new `parse` on its next message; the main thread picks up the new `fill` on the next cook. Adding a brand-new **physical stream** still needs a `Rebuild()` (that's a `build()` change). Safe to call while stopped — it just primes state for the next Start. Triggered automatically when `Auto Reload` is on and a Streams block/binding/Handler changes, or manually via the `Reload Handlers` pulse.
 
 ---
 
@@ -333,7 +341,9 @@ def fill(scriptOp, data):
 
 - `parse` **overrides** the built-in decoder for that stream; omit it to keep the default decode.
 - `fill` **overrides** the default push; omit it to use the default (numpy → Script TOP).
-- Handlers are (re)loaded on **Start/Rebuild** (like the Pipeline DAT). A failing handler reports to `Lasterror` and is skipped — it never stalls the pump.
+- Handlers are loaded on **Start**, and **hot-reload into a running pipeline** when you add/edit a Streams block, its `Scriptop`, or its `Handler` DAT — automatically while `Auto Reload` is on, or on demand via the `Reload Handlers` pulse / `ReloadHandlers()`. No device restart is needed; only adding a brand-new **physical stream** (a `build()` change) requires a `Rebuild`. A failing handler reports to `Lasterror` and is skipped — it never stalls the pump.
+
+> Binding an existing ndarray stream to a plain **Script TOP** (no Handler) updates live on its own — the sequence is read every cook. Anything needing a custom `parse`/`fill` (Script CHOP/SOP/DAT, or a non-default decode) is what the hot-reload applies.
 
 #### Push vs pull, by operator family
 
@@ -461,6 +471,52 @@ def build(pipeline):
     return queues, ['rgb'], controls
 ```
 
+### Model Pre-fetch
+
+Resolving a neural model inline (the Model Zoo's online freshness check + download, or loading an archive) is largely Python-level work that **holds the GIL** — done on the camera pump it still froze TouchDesigner for several seconds, because the worker and TD share one interpreter. So declared models are fetched in a **separate process** (its own GIL) before the device pipeline is built, and progress streams back into the read-only **Models** sequence while the UI stays responsive.
+
+#### Declaring models
+
+A pipeline script declares the models it uses with a module-level `MODELS` list (a bare `MODEL = '...'` is also accepted). This is read on **Start** by exec-ing the script in a throwaway namespace, so keep the heavy work inside `build()` — only the assignment needs to be at module level.
+
+```python
+MODEL  = 'luxonis/yolov8-nano-pose-estimation:coco-512x384'
+MODELS = [MODEL]            # one entry per model build() resolves
+```
+
+Each entry is classified automatically:
+
+- **HubAI zoo slug** (anything that isn't a local file) → downloaded via `getModelFromZoo` in the pre-fetch subprocess, into the shared cache (`.depthai_cached_models/`, set with `DEPTHAI_ZOO_CACHE_PATH`). Progress (depthai's JSON download bytes) is mirrored into the block's `Progress` 0→1.
+- **Local file** (a path that resolves, absolute or relative to `project.folder`) → an NNArchive/blob already on disk. No download; the block shows `1.0` (ready) immediately.
+
+After a successful pre-fetch of a zoo slug, the in-process `build()` runs with `DEPTHAI_ZOO_INTERNET_CHECK=0` so it loads the cached archive instead of repeating the online check. An all-local pipeline leaves the check on, so any incidental zoo resolve still works.
+
+The subprocess uses the project's **`.venv` interpreter** (`/.venv/Scripts/python.exe`, falling back to TD's Python); that environment must have `depthai` installed.
+
+> Declaring `MODELS` is optional. With none declared, `build()` resolves models itself inline — simplest, but that's the path that briefly hangs the UI.
+
+#### Custom & converted models
+
+Pass a local model straight to the parser node — `ParsingNeuralNetwork.build()` accepts a `dai.NNArchive` and skips the zoo entirely:
+
+```python
+MODELS = ['models/mymodel.tar.xz']     # resolves to a file → classified local, no download
+
+def build(pipeline):
+    import depthai as dai
+    from depthai_nodes.node import ParsingNeuralNetwork
+    cam     = pipeline.create(dai.node.Camera).build()
+    archive = dai.NNArchive(f'{project.folder}/models/mymodel.tar.xz')
+    nn      = pipeline.create(ParsingNeuralNetwork).build(cam, archive)
+    return ({'rgb': nn.passthrough.createOutputQueue(maxSize=1, blocking=False),
+             'out': nn.out.createOutputQueue(maxSize=1, blocking=False)},
+            ['rgb', 'out'])
+```
+
+A bare blob without parser metadata won't work with `ParsingNeuralNetwork` (it needs the NNArchive config to pick parsers) — use a plain `dai.node.NeuralNetwork` for those.
+
+**Conversion** of a raw model (ONNX/OpenVINO/TFLite → NNArchive for RVC2/RVC4, or a legacy MyriadX blob via `blobconverter` for RVC2 only) is a **one-time offline step** done with Luxonis tooling ([Hub](https://models.luxonis.com/) / `modelconverter`). It can take minutes — never run it inside `build()` on the Start path. Commit the resulting NNArchive and reference it as a local entry in `MODELS`.
+
 ### Bundled pipeline scripts
 
 | File | Device | Streams | Controls |
@@ -481,8 +537,9 @@ def build(pipeline):
 
 The camera pump runs in a **background thread** managed by TD's `ThreadManager`. Frame data is transferred to the main thread via a `threading.Lock`-protected dictionary.
 
-- **Background thread** (`_cameraPump`): opens the device, starts the pipeline, polls output queues in a tight loop, **decodes** each message (built-in decoder or a Handler's `parse`), and writes the plain result to the shared dict.
-- **Main thread** (`_onRefresh`): called by the Thread Manager each cook, reads shared state, updates TD parameters, and **fills** Script OPs (push for TOP/CHOP/DAT, pull for SOP via `FillScriptOp`).
+- **Background thread** (`cameraPump`): opens the device, **pre-fetches declared models on a subprocess** (streaming download progress into shared state — see [Model Pre-fetch](#model-pre-fetch)), builds and starts the pipeline, polls output queues in a tight loop, **decodes** each message (built-in decoder or a Handler's `parse`), and writes the plain result to the shared dict. On exit (any path) it closes the device in its `finally`, keeping that blocking call off the main thread.
+- **Main thread** (`onRefresh`): called by the Thread Manager each cook, reads shared state, updates TD parameters, mirrors per-model download progress into the **Models** sequence, and **fills** Script OPs (push for TOP/CHOP/DAT, pull for SOP via `FillScriptOp`).
+- **Model pre-fetch subprocess**: spawned from the background thread with its own interpreter, so the GIL-holding zoo download/check runs without blocking either TD thread. It reports progress as JSON on stdout, which the background thread parses and the main thread reflects.
 - **`SendControl`**: calls `InputQueue.send()` directly from the main thread. depthai input queues are designed for cross-thread use; no intermediate queue is needed.
 
-The background thread **must not access any TD objects** (`op()`, `me`, `run()`, parameters, etc.) — this is why a Handler's `parse` (worker thread) must stay pure-Python/numpy while `fill` (main thread) does the operator I/O. Handler DAT text is read on the main thread at Start/Rebuild and handed to the worker, since reading a DAT is itself TD access. All TD access happens exclusively in the Thread Manager hooks.
+The background thread **must not access any TD objects** (`op()`, `me`, `run()`, parameters, etc.) — this is why a Handler's `parse` (worker thread) must stay pure-Python/numpy while `fill` (main thread) does the operator I/O. Handler DAT text is read on the main thread (it's TD access) and the resulting `parse`/`fill` callables are stored on the extension; the worker reads `self._parsers` fresh per message rather than capturing it, so `ReloadHandlers()` can swap the whole dict on the main thread (an atomic reference reassignment) and the running worker picks it up with no restart and no lock. All TD access happens exclusively in the Thread Manager hooks.

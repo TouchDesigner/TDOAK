@@ -12,6 +12,10 @@ build/
 # TouchDesigner
 touch/*.tox
 *.tox
+Backup/
+
+# depthai model cache
+.depthai_cached_models/
 
 # Editors
 .vscode/

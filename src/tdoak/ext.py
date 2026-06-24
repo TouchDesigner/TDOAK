@@ -1,6 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
+import os
 import threading
 import time
 from typing import TYPE_CHECKING, Callable, Protocol, TypedDict
@@ -66,7 +67,10 @@ class PipelineConfig(TypedDict):
     enableDepth:    bool
     enableImu:      bool
     pipelineScript: str | None
-    parsers:        dict[str, ParseFn]
+    models:         list[str]   # everything the script declares (module-level MODELS): slugs + local paths
+    localModels:    list[str]   # subset of models that resolve to a local file → load directly, no zoo prefetch
+    cacheDir:       str         # DEPTHAI_ZOO_CACHE_PATH shared by the prefetch subprocess + in-proc build
+    venvPython:     str         # interpreter to run the prefetch subprocess with
 
 
 # Per-stream handler hooks (defined in a Streams-block Handler DAT):
@@ -162,7 +166,7 @@ class OAKManagerExt:
         self._reconnectDelay:    float                                      = 10.0
         self._retryCount:        int                                        = 0
         self._stopFlag:          threading.Event                            = threading.Event()
-        self._datVersion:        int                                        = -1
+        self._datVersion:        int | None                                 = None
         self._latestDevices:     list[DeviceInfo]                          = []
         self._onDevicesCallback: Callable[[list[DeviceInfo]], None] | None = None
         self._activePipeline:    _Pipeline | None                           = None
@@ -170,9 +174,14 @@ class OAKManagerExt:
         self._intrinsics:        dict[str, dict[str, float]]               = {}
         self._controlQueues:     dict[str, _InputQueue]                    = {}
         self._fillers:           dict[str, FillFn]                         = {}  # keyed by fillerId '{stream}#{i}'
+        # Parsers are read by the worker (runPipeline) per message and swapped atomically by the
+        # main thread on a handler reload — keyed by stream name, lock-free (whole-dict reassign).
+        self._parsers:           dict[str, ParseFn]                        = {}
+        self._handlersVersion:   int | None                                = None  # baseline for auto-reload
         self._frameSeq:          int                                       = 0
 
         self._scriptopRegistry: dict[str, list[OP]] = {}
+        self._modelProgress:    dict[str, float]     = {}  # zoo slug -> download fraction 0..1
         self._lastStreamNames:  list[str]            = []
         self._lastImageHW:      tuple[int, int] | None = None  # (h, w) of last image frame, for organizing point clouds
 
@@ -195,16 +204,32 @@ class OAKManagerExt:
         self._stopFlag.clear()
         config = self.readConfig()
         # Seed the Autoreload baseline to the DAT we're starting with. Otherwise _datVersion
-        # stays at its -1 sentinel and the first onRefresh tick reads changeCount != -1 as an
-        # edit, firing a spurious Rebuild() a moment after every Start.
+        # stays at its None sentinel and the first onRefresh tick reads a real hash != None as
+        # an edit, firing a spurious Rebuild() a moment after every Start.
         datRef = self.ownerComp.par.Pipelinedat.eval()
         dat    = op(datRef) if datRef else None
-        self._datVersion = dat.changeCount if dat else -1
-        # Load per-stream Handler DATs on the main thread: parsers ride along in config
-        # for the worker, fillers stay here for the main-thread cook side.
-        parsers, fillers = self.loadStreamHandlers()
-        config['parsers'] = parsers
-        self._fillers     = fillers
+        self._datVersion = self._datContentHash(dat)
+        # Load per-stream Handler DATs on the main thread (the worker can't touch ops): parsers
+        # are read by the worker, fillers by the main-thread cook side. Both live on the instance
+        # so ReloadHandlers() can hot-swap them without restarting the pipeline. Seed the
+        # handlers-version baseline too, so the first onRefresh tick doesn't fire a spurious reload.
+        parsers, fillers   = self.loadStreamHandlers()
+        self._parsers      = parsers
+        self._fillers      = fillers
+        self._handlersVersion = self.handlersContentHash()
+        # Models the pipeline script declares (module-level MODELS = [...]) get pre-fetched on a
+        # worker subprocess so the download never holds TD's GIL. Mirror them into the readonly
+        # Models sequence here (main thread, the only place TD ops are touchable) so each model
+        # gets a live Progress readout that onRefresh updates while the subprocess runs.
+        models = self.readPipelineModels(config)
+        local  = self.localModels(models)
+        config['models']      = models
+        config['localModels'] = list(local)
+        # Local NNArchive/blob models need no download — seed them at 1.0 so the sequence shows
+        # them ready immediately; zoo slugs start at 0.0 and fill as the prefetch streams.
+        with self._lock:
+            self._modelProgress = {m: (1.0 if m in local else 0.0) for m in models}
+        self.setupModelBlocks(models)
         task = self.ThreadManager.TDTask(
             target=self.cameraPump,
             args=(config, self._stopFlag),
@@ -221,6 +246,17 @@ class OAKManagerExt:
         self.Stop()
         run('args[0].Start()', self, delayFrames=5, fromOP=self.ownerComp)
 
+    def ReloadHandlers(self) -> None:
+        """Re-load the Streams blocks' Handler DATs and hot-swap parse/fill into the running
+        pipeline — no device/pipeline restart. Use after adding or editing a Streams block,
+        its Scriptop, or its Handler DAT. Adding a brand-new *physical* stream still needs a
+        Rebuild (that's a pipeline build() change). Safe to call when stopped — it just primes
+        state for the next Start."""
+        parsers, fillers      = self.loadStreamHandlers()
+        self._fillers         = fillers       # read live on the main thread by pushToScriptops
+        self._parsers         = parsers        # whole-dict reassign → the worker picks it up atomically
+        self._handlersVersion = self.handlersContentHash()
+
     def ListDevices(self, callback: Callable[[list[DeviceInfo]], None] | None = None) -> None:
         self._onDevicesCallback = callback
         task = self.ThreadManager.TDTask(
@@ -233,10 +269,11 @@ class OAKManagerExt:
     def GetDevices(self) -> list[DeviceInfo]:
         with self._lock: return list(self._latestDevices)
 
-    def OnPulseStart(self, par: Par) -> None:       self.Start()
-    def OnPulseStop(self, par: Par) -> None:        self.Stop()
-    def OnPulseRebuild(self, par: Par) -> None:     self.Rebuild()
-    def OnPulseListdevices(self, par: Par) -> None: self.ListDevices()
+    def OnPulseStart(self, par: Par) -> None:          self.Start()
+    def OnPulseStop(self, par: Par) -> None:           self.Stop()
+    def OnPulseRebuild(self, par: Par) -> None:        self.Rebuild()
+    def OnPulseListdevices(self, par: Par) -> None:    self.ListDevices()
+    def OnPulseReloadhandlers(self, par: Par) -> None: self.ReloadHandlers()
 
     def RegisterScriptop(self, streamName: str, scriptop: OP) -> None:
         """Bind a Script TOP or Script CHOP to receive data for streamName.
@@ -402,6 +439,12 @@ class OAKManagerExt:
     def pushDevices(self, devices: list[DeviceInfo]) -> None:
         with self._lock: self._latestDevices = devices
 
+    def setModelProgress(self, model: str, frac: float) -> None:
+        """Worker thread: record a model's download fraction (0..1). onRefresh mirrors it
+        into the matching Models block's Progress par on the main thread."""
+        with self._lock:
+            self._modelProgress[model] = min(max(frac, 0.0), 1.0)
+
     def pushStatus(self, connected: bool, fps: float = 0.0, latency: float = 0.0,
                     error: str = '', streams: list[str] | None = None) -> None:
         with self._lock:
@@ -442,6 +485,76 @@ class OAKManagerExt:
         self.pushDevices([])
         self.ownerComp.par.Lasterror = errorMsg
 
+    def downloadModels(self, config: PipelineConfig, platform: str,
+                       stopFlag: threading.Event) -> bool:
+        """WORKER thread. Pre-fetch each declared model on a child interpreter so the
+        download holds its OWN GIL, not TD's. Parse depthai's JSON progress
+        ({"download_now", "download_total", "model_name", "log_type": "download"}, emitted
+        ~every 100ms) and push a 0..1 fraction per model. Returns True if every model exited
+        cleanly (so the caller can trust the cache and skip the online check)."""
+        import json
+        import subprocess
+        import sys
+
+        # Local models are loaded straight from disk in the script's build() — nothing to fetch,
+        # so just mark them complete. Only zoo slugs go through getModelFromZoo.
+        local = set(config['localModels'])
+        for model in local:
+            self.setModelProgress(model, 1.0)
+        zooModels = [m for m in config['models'] if m not in local]
+        if not zooModels:
+            return True
+
+        python = config['venvPython'] if os.path.exists(config['venvPython']) else sys.executable
+        env = dict(os.environ)
+        env['DEPTHAI_ZOO_CACHE_PATH'] = config['cacheDir']
+        env['DEPTHAI_ZOO_INTERNET_CHECK'] = '1'  # the subprocess is allowed to hit the network
+        # NNModelDescription needs the device platform (RVC2/RVC4) to resolve the right artifact.
+        code = (
+            'import sys, depthai as dai\n'
+            'd = dai.NNModelDescription()\n'
+            'd.model = sys.argv[1]\n'
+            'd.platform = sys.argv[2]\n'
+            "dai.getModelFromZoo(d, useCached=True, progressFormat='json')\n"
+        )
+        flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0  # type: ignore[attr-defined]
+        allOk = True
+
+        for model in zooModels:
+            if stopFlag.is_set():
+                return False
+            proc = subprocess.Popen(
+                [python, '-c', code, model, platform],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env=env, creationflags=flags,
+            )
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                if stopFlag.is_set():
+                    proc.terminate()
+                    proc.wait()
+                    return False
+                line = line.strip()
+                if not line.startswith('{'):
+                    continue  # depthai's own [info] logs aren't JSON — ignore them
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get('log_type') != 'download':
+                    continue
+                total = msg.get('download_total') or 0
+                if total:
+                    self.setModelProgress(model, msg.get('download_now', 0) / total)
+            proc.wait()
+            if proc.returncode == 0:
+                self.setModelProgress(model, 1.0)  # cached archives emit no progress; force full
+            else:
+                allOk = False
+                with self._lock:
+                    self._lastError = f'download[{model}] failed (exit {proc.returncode})'
+        return allOk
+
     def cameraPump(self, config: PipelineConfig, stopFlag: threading.Event) -> None:
         # Worker entry point. Tear the device down HERE (worker thread) on every exit path:
         # device.close()/pipeline.stop() are blocking depthai calls, and the SuccessHook/
@@ -462,6 +575,20 @@ class OAKManagerExt:
             self._activeDevice = None
             pipeline = dai.Pipeline()
 
+        # Pre-fetch declared models on a subprocess (its own interpreter = its own GIL) so the
+        # download stays off TD's main thread and we can stream a live progress counter. Then
+        # point the in-process build at the same cache and skip the online freshness check, so
+        # build() loads the cached archive instead of doing a GIL-holding network round-trip.
+        platform = pipeline.getDefaultDevice().getPlatformAsString()  # type: ignore[attr-defined]
+        prefetched = self.downloadModels(config, platform, stopFlag)
+        # Only trust the cache (skip the online check) when we actually pre-fetched a zoo slug.
+        # An all-local pipeline leaves the check on so any incidental zoo resolve still works.
+        zooDeclared = any(m not in set(config['localModels']) for m in config['models'])
+        os.environ['DEPTHAI_ZOO_CACHE_PATH']     = config['cacheDir']
+        os.environ['DEPTHAI_ZOO_INTERNET_CHECK'] = '0' if (zooDeclared and prefetched) else '1'
+        if stopFlag.is_set():
+            return  # Stop pressed mid-download — don't build/start; cameraPump's finally closes the device
+
         queues, streamNames, controlQueues = self.buildPipeline(pipeline, config)
         self.pushStatus(False, streams=streamNames)
 
@@ -472,7 +599,6 @@ class OAKManagerExt:
             self._controlQueues = controlQueues
         self.pushStatus(True, streams=streamNames)
 
-        parsers: dict[str, ParseFn] = config['parsers']
         frameCount: int   = 0
         fpsTimer:   float = time.monotonic()
         tdThread          = threading.current_thread()
@@ -491,7 +617,9 @@ class OAKManagerExt:
                 # Custom per-stream decode wins: turn the (model-specific) message into
                 # plain, thread-safe data. Anything not handled here falls through to the
                 # built-in decoders below (the QoL path for rgb/depth/tof/detections/imu).
-                parseFn = parsers.get(name)
+                # Read self._parsers fresh each message so ReloadHandlers() can hot-swap them
+                # (whole-dict reassign on the main thread → atomic, no torn read) mid-run.
+                parseFn = self._parsers.get(name)
                 if parseFn is not None:
                     try:
                         data = parseFn(msg)
@@ -753,6 +881,40 @@ class OAKManagerExt:
 
     # ── Stream menu + scriptop dispatch (main thread) ────────────────────
 
+    def setupModelBlocks(self, models: list[str]) -> None:
+        """Main thread. Resize the readonly Models sequence to one block per declared model and
+        fill in each Model name, resetting Progress to 0. Grow with numBlocks (the documented
+        'press +' equivalent) and shrink with destroyBlock from the tail."""
+        seq = getattr(self.ownerComp.seq, 'Models', None)
+        if seq is None:
+            return
+        needed = len(models)
+        while seq.numBlocks < needed:
+            seq.numBlocks += 1
+        while seq.numBlocks > needed:
+            before = seq.numBlocks
+            seq.destroyBlock(seq.numBlocks - 1)
+            if seq.numBlocks >= before:
+                break  # sequence hit its minimum block count and won't shrink further
+        for i, model in enumerate(models):
+            seq.blockPars.Model[i].val    = model
+            seq.blockPars.Progress[i].val = 0.0
+
+    def updateModelProgress(self) -> None:
+        """Main thread. Mirror the worker's per-model download fractions into each Models
+        block's Progress par, matched by the block's Model name."""
+        seq = getattr(self.ownerComp.seq, 'Models', None)
+        if seq is None or len(seq) == 0:
+            return
+        with self._lock:
+            progress = dict(self._modelProgress)
+        if not progress:
+            return
+        for i in range(len(seq)):
+            frac = progress.get(seq.blockPars.Model[i].eval())
+            if frac is not None:
+                seq.blockPars.Progress[i].val = frac
+
     def updateStreamMenus(self, streamNames: list[str]) -> None:
         """Update the Stream menu on block[0]; TD propagates to all other blocks."""
         if streamNames == self._lastStreamNames:
@@ -821,15 +983,47 @@ class OAKManagerExt:
 
     # ── Thread Manager hooks (main thread) ────────────────────────────────
 
+    def _datContentHash(self, dat: OP | None) -> int | None:
+        """Hash of a DAT's contents, used to detect edits for Autoreload. ``dat.text``
+        covers both Text and Table DATs (tables come back tab-delimited). Returns None
+        when there's no DAT, which never compares equal to a real content hash."""
+        return hash(dat.text) if dat else None
+
+    def handlersContentHash(self) -> int:
+        """Hash of the handler-relevant Streams state — block count plus each block's Stream,
+        Scriptop path, and Handler DAT text. Changes when a block/binding/handler is added,
+        removed, or edited, so Autoreload can hot-reload handlers without a full Rebuild."""
+        seq = getattr(self.ownerComp.seq, 'Streams', None)
+        if seq is None:
+            return hash(())
+        parts: list[object] = []
+        for i in range(len(seq)):
+            stream   = seq.blockPars.Stream[i].eval()
+            scriptop = seq.blockPars.Scriptop[i].eval()
+            try:
+                handler = seq.blockPars.Handler[i].eval()
+            except Exception:
+                handler = None  # Handler param not added on this build
+            parts.append((stream,
+                          scriptop.path if scriptop is not None else None,
+                          handler.text if handler is not None else None))
+        return hash(tuple(parts))
+
     def onRefresh(self) -> None:
         if self.ownerComp.par.Autoreload.eval():
             datRef: str = self.ownerComp.par.Pipelinedat.eval()
             if datRef:
                 dat = op(datRef)
-                if dat and dat.changeCount != self._datVersion:
-                    self._datVersion = dat.changeCount
-                    self.Rebuild()
+                version = self._datContentHash(dat)
+                if dat and version != self._datVersion:
+                    self._datVersion = version
+                    self.Rebuild()           # pipeline build() changed → full restart
                     return
+            # Streams blocks / bindings / Handler DATs changed → hot-reload only, no device restart.
+            handlersVersion = self.handlersContentHash()
+            if handlersVersion != self._handlersVersion:
+                self._handlersVersion = handlersVersion
+                self.ReloadHandlers()
 
         status = self.GetStatus()
         self.ownerComp.par.Connected     = 1 if status['connected'] else 0
@@ -837,6 +1031,7 @@ class OAKManagerExt:
         self.ownerComp.par.Activestreams = ', '.join(status['streams'])
         self.ownerComp.par.Lasterror     = status['error']
         self.updateStreamMenus(status['streams'])
+        self.updateModelProgress()
         self.pushToScriptops()
 
     def closeActiveDevice(self) -> None:
@@ -888,14 +1083,54 @@ class OAKManagerExt:
         datRef: str = par.Pipelinedat.eval()
         raw_device: str = par.Device.eval().strip()
         device: str = '' if raw_device in ('', 'None') else raw_device
+        # project.folder is the .toe directory — depthai's default cache already lands in its
+        # .depthai_cached_models, and the venv sits beside it; both read on the main thread here
+        # so the worker (which can't touch TD) gets them via config.
+        projFolder: str = project.folder
         return PipelineConfig(
             device=         device,
             fps=            int(par.Fps.eval()),
             enableDepth=    bool(par.Enabledepth.eval()),
             enableImu=      bool(par.Enableimu.eval()),
             pipelineScript= op(datRef).text if datRef else None,
-            parsers=        {},  # filled in doStart via loadStreamHandlers()
+            models=         [],  # filled in doStart via readPipelineModels()
+            localModels=    [],  # filled in doStart via localModels()
+            cacheDir=       os.path.join(projFolder, '.depthai_cached_models'),
+            venvPython=     os.path.join(projFolder, '.venv', 'Scripts', 'python.exe'),
         )
+
+    def readPipelineModels(self, config: PipelineConfig) -> list[str]:
+        """Main thread. Extract the zoo slugs a pipeline script declares via a module-level
+        ``MODELS = [...]`` (a bare ``MODEL = '...'`` is also accepted). The script is exec'd in
+        a throwaway namespace — by convention the heavy work lives in build(), so module level
+        is cheap. Returns [] on any error (the build then just resolves models online itself)."""
+        script = config['pipelineScript']
+        if not script:
+            return []
+        namespace: dict[str, object] = {}
+        try:
+            exec(script, namespace)
+        except Exception as exc:
+            self.ownerComp.par.Lasterror = f'model scan error: {exc}'
+            return []
+        decl = namespace.get('MODELS', namespace.get('MODEL'))
+        if isinstance(decl, str):
+            decl = [decl]
+        if not isinstance(decl, (list, tuple)):
+            return []
+        return [str(m) for m in decl if m]
+
+    def localModels(self, entries: list[str]) -> set[str]:
+        """Main thread. Entries that resolve to an existing file (absolute, or relative to the
+        project) are local NNArchive/blob models loaded directly via dai.NNArchive — no zoo
+        prefetch. Everything else is treated as a HubAI zoo slug. project.folder needs TD, so
+        this runs here and the result rides to the worker in config['localModels']."""
+        local: set[str] = set()
+        for entry in entries:
+            path = entry if os.path.isabs(entry) else os.path.join(project.folder, entry)
+            if os.path.exists(path):
+                local.add(entry)
+        return local
 
     @staticmethod
     def fillerId(streamName: str, index: int) -> str:
