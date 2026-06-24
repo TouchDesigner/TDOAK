@@ -70,30 +70,57 @@ def _landmarksOutput(pnn) -> dai.Node.Output:
 
 def build(pipeline: dai.Pipeline) -> tuple[dict[str, dai.DataOutputQueue], list[str]]:
     import depthai as dai
-    from depthai_nodes.node import ParsingNeuralNetwork, FrameCropper, GatherData
+    from depthai_nodes.node import ParsingNeuralNetwork, GatherData
 
     cam = pipeline.create(dai.node.Camera).build()
 
     # ── Stage 1: palm detection (rotated boxes) ───────────────────────────────
     palm = pipeline.create(ParsingNeuralNetwork).build(cam, PALM_MODEL)
 
-    # One rotated + padded crop per palm, resized to the landmarker's input.
-    # fromImgDetections reads det.getBoundingBox() (a RotatedRect) so the crop follows
-    # the hand's orientation; STRETCH maps crop coords linearly to that rect, which keeps
-    # the landmark back-map in the handler a simple affine transform.
-    cropper = (
-        pipeline.create(FrameCropper)
-        .fromImgDetections(
-            inputImgDetections=palm.out,
-            outputSize=HAND_INPUT,
-            resizeMode=dai.ImageManipConfig.ResizeMode.STRETCH,
-            padding=CROP_PADDING,
-        )
-        .build(inputImage=palm.passthrough)
-    )
+    # ── One rotated + padded crop per palm, resized to the landmarker input ────
+    # NB: we DON'T use depthai_nodes' FrameCropper.fromImgDetections — its on-device
+    # Script builds Size2f(width=…, height=…, normalized=True), but the firmware's
+    # Size2f only accepts positional args, so it raises per detection. We emit the crop
+    # configs ourselves and set the rect via attribute assignment (the same approach as
+    # depthai_nodes' detection_config_generator), which avoids the Size2f constructor.
+    # STRETCH maps crop coords linearly onto the rect → the handler back-map stays affine.
+    cropW, cropH = HAND_INPUT
+    cropScript = pipeline.create(dai.node.Script)
+    cropScript.setScript(f"""
+try:
+    while True:
+        frame = node.inputs['frame'].get()
+        dets  = node.inputs['dets'].get()
+        for det in dets.detections:
+            rr = det.getBoundingBox()
+            rect = RotatedRect()
+            rect.center.x   = rr.center.x
+            rect.center.y   = rr.center.y
+            rect.size.width  = rr.size.width  + 2 * {CROP_PADDING}
+            rect.size.height = rr.size.height + 2 * {CROP_PADDING}
+            rect.angle = rr.angle
+            cfg = ImageManipConfig()
+            cfg.addCropRotatedRect(rect, True)
+            cfg.setOutputSize({cropW}, {cropH}, ImageManipConfig.ResizeMode.STRETCH)
+            cfg.setFrameType(ImgFrame.Type.BGR888p)
+            cfg.setTimestamp(dets.getTimestamp())
+            cfg.setSequenceNum(dets.getSequenceNum())
+            node.outputs['cfg'].send(cfg)
+            node.outputs['img'].send(frame)
+except Exception as e:
+    node.error(str(e))
+""")
+    palm.passthrough.link(cropScript.inputs['frame'])
+    palm.out.link(cropScript.inputs['dets'])
+
+    crop = pipeline.create(dai.node.ImageManip)
+    crop.setMaxOutputFrameSize(cropW * cropH * 3)
+    crop.inputConfig.setWaitForMessage(True)
+    cropScript.outputs['cfg'].link(crop.inputConfig)
+    cropScript.outputs['img'].link(crop.inputImage)
 
     # ── Stage 2: 21-point hand landmarks on each crop ─────────────────────────
-    landmarks = pipeline.create(ParsingNeuralNetwork).build(cropper.out, HAND_MODEL)
+    landmarks = pipeline.create(ParsingNeuralNetwork).build(crop.out, HAND_MODEL)
 
     # ── Re-pair each hand's landmarks with its palm detection ─────────────────
     # waitCountFn defaults to len(reference.detections) → one landmark set per palm.
