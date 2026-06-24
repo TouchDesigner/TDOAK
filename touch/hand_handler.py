@@ -45,6 +45,10 @@ def parse(msg):
     """GatheredData -> list of hands. Each hand's landmarks come back normalized within its
     (rotated, padded) crop; map them onto the full frame via the palm's RotatedRect so they
     overlay the 'rgb' stream directly. items[i] corresponds to detections[i] (crop order)."""
+    if not hasattr(msg, 'reference_data'):
+        raise TypeError(
+            f"hand_handler.parse received a {type(msg).__name__}, expected GatheredData. "
+            "Bind this Handler to the 'hands' stream block, not an image stream.")
     detections = msg.reference_data.detections
     hands = []
     for det, item in zip(detections, msg.items):
