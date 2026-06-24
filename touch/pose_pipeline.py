@@ -1,4 +1,5 @@
 ﻿from __future__ import annotations
+from datetime import timedelta
 
 # pose_pipeline.py — YOLOv8-nano human pose / skeleton tracking (depthai v3)
 # Load into the Pipeline DAT parameter of the OAK component.
@@ -36,8 +37,7 @@ if TYPE_CHECKING:
 
 # Model Zoo slug + variant (288×512 input). Swap to the large variant
 # 'luxonis/yolov8-large-pose-estimation:coco-640x352' for accuracy over speed.
-MODEL: str = 'luxonis/yolov8-nano-pose-estimation:coco-512x288'
-MODEL: str = 'luxonis/yolov8-nano-pose-estimation:coco-512x384:0834fcb'
+MODEL: str = 'luxonis/yolov8-nano-pose-estimation:coco-512x384'
 
 # Declared so the host (OAKManagerExt) pre-fetches every model on a subprocess with a live
 # progress counter before the in-process build runs. List every zoo slug build() resolves.
@@ -48,11 +48,21 @@ def build(pipeline: dai.Pipeline) -> tuple[dict[str, dai.DataOutputQueue], list[
     from depthai_nodes.node import ParsingNeuralNetwork
 
     cam = pipeline.create(dai.node.Camera).build()
+    hd = cam.requestOutput((1280, 720), type=dai.ImgFrame.Type.BGR888p, fps=30)
     nn  = pipeline.create(ParsingNeuralNetwork).build(cam, MODEL)
+    
+    # sync camera frame and detection frame
+    sync = pipeline.create(dai.node.Sync)
+    sync.setSyncThreshold(timedelta(milliseconds=10))
+    hd.link(sync.inputs['rgb'])
+    nn.out.link(sync.inputs['pose'])
+    
+    demux = pipeline.create(dai.node.MessageDemux)
+    sync.out.link(demux.input)
 
     queues: dict[str, dai.DataOutputQueue] = {
-        'rgb':  nn.passthrough.createOutputQueue(maxSize=1, blocking=False),
-        'pose': nn.out.createOutputQueue(maxSize=1, blocking=False),
+        'rgb': demux.outputs['rgb'].createOutputQueue(maxSize=1, blocking=False),
+        'pose': demux.outputs['pose'].createOutputQueue(maxSize=1, blocking=False)
     }
 
     return queues, ['rgb', 'pose']
