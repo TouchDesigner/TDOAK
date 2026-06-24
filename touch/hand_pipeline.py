@@ -52,6 +52,22 @@ FPS: int = 30                              # camera fps, used by GatherData for 
 MODELS: list[str] = [PALM_MODEL, HAND_MODEL]
 
 
+def _landmarksOutput(pnn) -> dai.Node.Output:
+    """The hand landmarker exposes 3 heads (keypoints + score + handedness), so its `.out`
+    is unavailable — pick the KeypointParser head's output by type (it's head 0, but select
+    on type so head reordering can't break us)."""
+    i = 0
+    while True:
+        try:
+            parser = pnn.getParser(index=i)
+        except KeyError:
+            break
+        if type(parser).__name__ == 'KeypointParser':
+            return pnn.getOutput(i)
+        i += 1
+    return pnn.getOutput(0)
+
+
 def build(pipeline: dai.Pipeline) -> tuple[dict[str, dai.DataOutputQueue], list[str]]:
     import depthai as dai
     from depthai_nodes.node import ParsingNeuralNetwork, FrameCropper, GatherData
@@ -81,9 +97,10 @@ def build(pipeline: dai.Pipeline) -> tuple[dict[str, dai.DataOutputQueue], list[
 
     # ── Re-pair each hand's landmarks with its palm detection ─────────────────
     # waitCountFn defaults to len(reference.detections) → one landmark set per palm.
+    # The landmarker is multi-head, so take the keypoints head specifically (see above).
     gather = pipeline.create(GatherData).build(
         cameraFps=FPS,
-        inputData=landmarks.out,
+        inputData=_landmarksOutput(landmarks),
         inputReference=palm.out,
     )
 
