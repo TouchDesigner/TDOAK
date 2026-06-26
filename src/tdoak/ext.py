@@ -173,10 +173,15 @@ class OAKManagerExt:
         self._activeDevice:      _Device | None                             = None
         self._intrinsics:        dict[str, dict[str, float]]               = {}
         self._controlQueues:     dict[str, _InputQueue]                    = {}
-        self._fillers:           dict[str, FillFn]                         = {}  # keyed by fillerId '{stream}#{i}'
+        self._fillers:           dict[str, FillFn]                         = {}  # live, keyed by bound op path
         # Parsers are read by the worker (runPipeline) per message and swapped atomically by the
         # main thread on a handler reload — keyed by stream name, lock-free (whole-dict reassign).
         self._parsers:           dict[str, ParseFn]                        = {}
+        # Component-registered handlers (RegisterHandler) live apart from the seq-derived ones so a
+        # handler reload (which rebuilds from the Streams sequence) can't clobber them. fillers are
+        # keyed by the consumer op's path (one fill per op), parsers by stream (one per queue).
+        self._componentFillers:  dict[str, FillFn]                         = {}
+        self._componentParsers:  dict[str, ParseFn]                        = {}
         self._handlersVersion:   int | None                                = None  # baseline for auto-reload
         self._frameSeq:          int                                       = 0
 
@@ -213,9 +218,7 @@ class OAKManagerExt:
         # are read by the worker, fillers by the main-thread cook side. Both live on the instance
         # so ReloadHandlers() can hot-swap them without restarting the pipeline. Seed the
         # handlers-version baseline too, so the first onRefresh tick doesn't fire a spurious reload.
-        parsers, fillers   = self.loadStreamHandlers()
-        self._parsers      = parsers
-        self._fillers      = fillers
+        self.applyHandlers(*self.loadStreamHandlers())
         self._handlersVersion = self.handlersContentHash()
         # Models the pipeline script declares (module-level MODELS = [...]) get pre-fetched on a
         # worker subprocess so the download never holds TD's GIL. Mirror them into the readonly
@@ -252,10 +255,18 @@ class OAKManagerExt:
         its Scriptop, or its Handler DAT. Adding a brand-new *physical* stream still needs a
         Rebuild (that's a pipeline build() change). Safe to call when stopped — it just primes
         state for the next Start."""
-        parsers, fillers      = self.loadStreamHandlers()
-        self._fillers         = fillers       # read live on the main thread by pushToScriptops
-        self._parsers         = parsers        # whole-dict reassign → the worker picks it up atomically
+        self.applyHandlers(*self.loadStreamHandlers())
         self._handlersVersion = self.handlersContentHash()
+
+    def applyHandlers(self, seqParsers: dict[str, ParseFn],
+                      seqFillers: dict[str, FillFn]) -> None:
+        """Compose the live parse/fill dicts from the two sources — the Streams sequence
+        (seq*, rebuilt on every reload) and the components (RegisterHandler, persistent).
+        Component registrations win on conflict and survive seq reloads. _fillers is read on
+        the main thread (cook side); _parsers is swapped whole so the worker reads it lock-free."""
+        self._fillers = {**seqFillers, **self._componentFillers}
+        with self._lock:
+            self._parsers = {**seqParsers, **self._componentParsers}
 
     def ListDevices(self, callback: Callable[[list[DeviceInfo]], None] | None = None) -> None:
         self._onDevicesCallback = callback
@@ -293,41 +304,117 @@ class OAKManagerExt:
             except ValueError:
                 pass
 
-    def bindingForOp(self, scriptop: OP) -> tuple[str, str | None] | None:
-        """Resolve a Script Operator's binding: (streamName, fillerId).
-        Streams blocks carry a per-block fillerId ({stream}#{i}); runtime-registered
-        scriptops have no block, so fillerId is None. Returns None if not bound."""
+    def RegisterHandler(self, scriptop: OP, streamName: str, handlerDat: OP | None) -> None:
+        """Ingest a consumer component's Handler DAT: exec it once and store its optional
+        parse(msg) — keyed by stream, run on the worker at decode time — and fill(scriptOp, data)
+        — keyed by this op's path, run inside the op's cook. Call when the component's
+        Stream/Handler par or the DAT's contents change (a parexec + DAT-execute), not per cook.
+        Pass handlerDat=None (or an empty DAT) to drop this op's fill — see UnregisterHandler for
+        full removal. Parse is shared per stream (one physical queue): the last component to
+        register a parse for a stream wins, and clearing one op's handler leaves it in place."""
+        import depthai as dai
+        key = scriptop.path
+        if handlerDat is None or not handlerDat.text.strip():
+            self._componentFillers.pop(key, None)
+            self._fillers.pop(key, None)
+            return
+        namespace: dict[str, object] = {'dai': dai, 'np': np}
+        try:
+            exec(handlerDat.text, namespace)
+        except Exception as exc:
+            self.ownerComp.par.Lasterror = f'handler[{key}] load error: {exc}'
+            return
+        fillFn  = namespace.get('fill')
+        parseFn = namespace.get('parse')
+        if callable(fillFn):
+            self._componentFillers[key] = fillFn        # type: ignore[assignment]
+            self._fillers[key]          = fillFn         # type: ignore[assignment]
+        else:
+            self._componentFillers.pop(key, None)
+            self._fillers.pop(key, None)
+        if callable(parseFn):
+            self._componentParsers[streamName] = parseFn  # type: ignore[assignment]
+            with self._lock:                               # atomic swap → worker reads safely
+                self._parsers = {**self._parsers, streamName: parseFn}  # type: ignore[dict-item]
+
+    def UnregisterHandler(self, scriptop: OP, streamName: str | None = None) -> None:
+        """Drop a component's handler. Always removes this op's fill (keyed by op path). If
+        streamName is given, also removes that stream's component parse — only do this when no
+        other component still relies on it, since parse is shared per physical queue."""
+        key = scriptop.path
+        self._componentFillers.pop(key, None)
+        self._fillers.pop(key, None)
+        if streamName is not None:
+            self._componentParsers.pop(streamName, None)
+            with self._lock:
+                self._parsers = {**self._parsers}
+                self._parsers.pop(streamName, None)
+
+    def RegisterComponent(self, scriptop: OP, streamName: str | None = None,
+                          handlerDat: OP | None = None) -> None:
+        """One-call wiring for a stream component: bind the scriptop to its stream and ingest its
+        Handler DAT. streamName/handlerDat default to the wrapper component's (scriptop.parent())
+        Stream and Handler pars, so the component wires itself with RegisterComponent(op('script1')).
+        Call on init and whenever the component's Stream/Handler par or the handler text changes —
+        not per cook. Re-binds cleanly across a Stream change: the op is cleared from any prior
+        stream first, so the registry never keeps a stale binding."""
+        comp = scriptop.parent()
+        if streamName is None:
+            streamPar  = getattr(comp.par, 'Stream', None)
+            streamName = streamPar.eval() if streamPar is not None else None
+        if handlerDat is None:
+            handlerPar = getattr(comp.par, 'Handler', None)
+            handlerDat = handlerPar.eval() if handlerPar is not None else None
+        if not streamName:
+            self.UnregisterComponent(scriptop)  # no stream yet → make sure nothing stale lingers
+            return
+        for prior in list(self._scriptopRegistry):  # drop any binding under a previous stream
+            if prior != streamName:
+                self.UnregisterScriptop(prior, scriptop)
+        self.RegisterScriptop(streamName, scriptop)
+        self.RegisterHandler(scriptop, streamName, handlerDat)
+
+    def UnregisterComponent(self, scriptop: OP) -> None:
+        """Tear down a stream component (e.g. on delete): unbind it from every stream and drop
+        its fill. Parse is left in place — it's shared per physical queue, so removing it is the
+        manager's call (a Rebuild/ReloadHandlers re-derives it), not a single component's."""
+        for streamName in list(self._scriptopRegistry):
+            self.UnregisterScriptop(streamName, scriptop)
+        self.UnregisterHandler(scriptop)
+
+    def bindingForOp(self, scriptop: OP) -> str | None:
+        """Resolve which stream a Script Operator is bound to, via the runtime registry
+        (RegisterScriptop, used by the components) or a Streams block. Fill is keyed by the
+        op's own path, so only the stream name is needed here. Returns None if not bound."""
         for streamName, ops in self._scriptopRegistry.items():
             if scriptop in ops:
-                return streamName, None
+                return streamName
         seq = getattr(self.ownerComp.seq, 'Streams', None)
         if seq is not None:
             for i in range(len(seq)):
                 regOp = seq.blockPars.Scriptop[i].eval()
                 if regOp is not None and regOp.path == scriptop.path:
-                    streamName = seq.blockPars.Stream[i].eval()
-                    return streamName, self.fillerId(streamName, i)
+                    return seq.blockPars.Stream[i].eval()
         return None
 
     def GetFrameForScriptop(self, scriptop: OP) -> FrameData | None:
         """Return the frame data for this scriptop via registry or sequential block.
         Call from a Script CHOP cook callback to pull data."""
-        binding = self.bindingForOp(scriptop)
-        return self.GetFrame(binding[0]) if binding is not None else None
+        streamName = self.bindingForOp(scriptop)
+        return self.GetFrame(streamName) if streamName is not None else None
 
     def FillScriptOp(self, scriptop: OP) -> bool:
-        """Pull entry point for Script SOPs (which can't be written outside their cook):
-        call this from the SOP's onCook to run the block's fill(scriptOp, data) inside it.
-        TOPs/CHOPs/DATs are auto-pushed by autoPush and don't need this, though calling it
-        is harmless. Falls back to copyNumpyArray for a Script TOP. Returns True if filled."""
-        binding = self.bindingForOp(scriptop)
-        if binding is None:
+        """Pull entry point: call from a Script Operator's onCook to fill it inside its cook.
+        Runs the op's bound fill(scriptOp, data) — registered via RegisterHandler or a Streams
+        block, both keyed by the op's path — against the latest frame for its stream. Falls back
+        to copyNumpyArray for a Script TOP with no custom fill. Returns True if it filled."""
+        name = self.bindingForOp(scriptop)
+        if name is None:
             return False
-        name, fillerId = binding
         data = self.GetFrame(name)
         if data is None:
             return False
-        filler = self._fillers.get(fillerId) if fillerId is not None else None
+        filler = self._fillers.get(scriptop.path)
         if filler is not None:
             filler(scriptop, data)
             return True
@@ -939,12 +1026,13 @@ class OAKManagerExt:
                 if not streamName or targetOp is None:
                     continue
                 self.autoPush(streamName, targetOp,
-                               self._fillers.get(self.fillerId(streamName, i)))
+                               self._fillers.get(targetOp.path))
 
-        # Runtime-registered scriptops have no Streams block, hence no per-block fill.
+        # Runtime-registered scriptops carry their fill (if any) under their op path, set by
+        # RegisterHandler — so a registered TOP/CHOP with a component handler still pushes.
         for streamName, opList in list(self._scriptopRegistry.items()):
             for targetOp in opList:
-                self.autoPush(streamName, targetOp, None)
+                self.autoPush(streamName, targetOp, self._fillers.get(targetOp.path))
 
     def autoPush(self, streamName: str, targetOp: OP, filler: FillFn | None) -> None:
         data = self.GetFrame(streamName)
@@ -1132,13 +1220,6 @@ class OAKManagerExt:
                 local.add(entry)
         return local
 
-    @staticmethod
-    def fillerId(streamName: str, index: int) -> str:
-        """Unique id for a Streams block's fill, so the same stream bound in several
-        blocks doesn't collide. Frames/parse stay keyed by stream (one physical queue),
-        but each block fills its own scriptop, so fill is keyed per block."""
-        return f'{streamName}#{index}'
-
     def loadStreamHandlers(self) -> tuple[dict[str, ParseFn], dict[str, FillFn]]:
         """Main thread. Exec each Streams block's Handler DAT (if the param exists) and
         collect its optional parse(msg) — run later on the worker — and fill(scriptOp, data)
@@ -1147,8 +1228,8 @@ class OAKManagerExt:
 
         parse is keyed by stream name: the worker reads one queue per physical stream, so
         a stream has a single parse (if two blocks on the same stream both define one, the
-        last loaded wins). fill is keyed by a per-block id ({stream}#{i}) so the same
-        stream bound in multiple blocks can fill each block's scriptop differently."""
+        last loaded wins). fill is keyed by the block's bound Scriptop path — the same key the
+        component path (RegisterHandler) uses — so a block with no Scriptop set carries no fill."""
         import depthai as dai
         parsers: dict[str, ParseFn] = {}
         fillers: dict[str, FillFn]  = {}
@@ -1167,12 +1248,13 @@ class OAKManagerExt:
             try:
                 exec(handlerDat.text, namespace)
             except Exception as exc:
-                self.ownerComp.par.Lasterror = f'handler[{self.fillerId(streamName, i)}] load error: {exc}'
+                self.ownerComp.par.Lasterror = f'handler[{streamName}#{i}] load error: {exc}'
                 continue
             parseFn = namespace.get('parse')
             fillFn  = namespace.get('fill')
             if callable(parseFn):
                 parsers[streamName] = parseFn  # type: ignore[assignment]
-            if callable(fillFn):
-                fillers[self.fillerId(streamName, i)] = fillFn  # type: ignore[assignment]
+            regOp = seq.blockPars.Scriptop[i].eval()
+            if callable(fillFn) and regOp is not None:
+                fillers[regOp.path] = fillFn  # type: ignore[assignment]
         return parsers, fillers
