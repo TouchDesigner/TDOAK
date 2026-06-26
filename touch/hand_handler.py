@@ -1,4 +1,4 @@
-# hand_handler.py — Handler DAT for the 'hands' stream of hand_pipeline.py
+﻿# hand_handler.py — Handler DAT for the 'hands' stream of hand_pipeline.py
 # Point a Streams block's Handler parameter at this DAT, bind its Scriptop to a Script SOP,
 # and add the onCook callback below to that SOP. `dai` and `np` are already in scope.
 #
@@ -80,18 +80,40 @@ def parse(msg):
     return hands
 
 
-def fill(scriptOp, hands):
-    """Draw one polyline skeleton per hand into a Script SOP (mirrors the pose example)."""
-    scriptOp.clear()
-    if not hands:
-        return
-    for hand in hands:
-        kpts = hand['keypoints']
-        pts = [scriptOp.appendPoint() for _ in kpts]
-        for p, (x, y) in zip(pts, kpts):
-            p.x, p.y, p.z = x, 1.0 - y, 0.0              # y-flip: rgb is flipud'd for display
-        n = len(pts)
-        for i, j in hand['edges']:
-            if i < n and j < n:
-                prim = scriptOp.appendPoly(2, closed=False, addPoints=False)
-                prim[0].point, prim[1].point = pts[i], pts[j]
+def fill(scriptOp, data):                 # data: list[PoseEntry]
+	# MAIN THREAD — full TD access, runs inside the operator's cook.
+	stagingData = scriptOp.createGeometryStagingData()
+
+	if not data:
+		scriptOp.buildGeometry(stagingData)
+		return
+	
+	stagingData.createPointAttrib(name='P')
+	# Stack every person's keypoints as samples -> (P*17, 2)
+
+	kp = np.concatenate(
+		[np.asarray(p['keypoints'], dtype=np.float32) for p in data],
+		axis=0,
+		)
+	
+	# this is of shape (n*17,2), but we need 3 coordinates per point
+	kp = np.pad(kp, ((0, 0), (0, 1)), mode='constant')
+	# flip y
+	kp[:, 1] = 1 - kp[:, 1]
+	stagingData.appendPointAttribValues('P', kp.tolist())
+
+	# now build the edges between the keypoints
+	# be careful, as we have to add 18 to every new detected array point indexes to account for more than 1 detection.
+	
+	edge_chunks = []
+	for i, p in enumerate(data):
+	    edges = np.asarray(p['edges'], dtype=np.float32)
+	    edges += i * 21
+	    edge_chunks.append(edges)
+	
+	edges = np.concatenate(edge_chunks, axis=0)
+
+	for e in edges:
+		stagingData.appendPrimLine(int(e[0]),int(e[1]))
+
+	scriptOp.buildGeometry(stagingData)
