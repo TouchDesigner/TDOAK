@@ -36,6 +36,7 @@ The component's `Connected`, `Fps`, `Activestreams`, and `Lasterror` parameters 
 | Parameter | Type | Description |
 |---|---|---|
 | `Device` | Menu | Target device MXID or IP. `-- Select Device --` uses the first available device. Populated by **List Devices**. |
+| `Log Level` | Menu | depthai verbosity (`trace`…`critical`), applied to the device on Start. Default `warn` silences the periodic `[info]` chatter (temperatures, cpu usage). |
 | `Start` | Pulse | Start the camera pipeline. Resets the retry counter. |
 | `Stop` | Pulse | Stop the pipeline cleanly. |
 | `Rebuild` | Pulse | Stop and restart (useful after changing parameters). |
@@ -328,7 +329,9 @@ Built-in decoders cover images (`rgb`, `depth`, `amplitude`, `color`, `ir_left/r
 Point a `Streams` block's `Handler` parameter at a DAT. It may define either or both of:
 
 ```python
-# `dai` and `np` are already in scope.
+# `dai`, `np`, and `oak` (the OAK component) are already in scope. Use `oak` to reach
+# the promoted API from a fill (e.g. oak.GetIntrinsics(...)) — fill runs inside the
+# extension, where a bare op('...') would resolve inside the component itself.
 
 def parse(msg):
     # BACKGROUND THREAD — no op()/me/TD access. depthai message -> plain data

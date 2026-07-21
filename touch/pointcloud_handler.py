@@ -26,10 +26,10 @@ def fill(scriptOp, depth) -> None:
         scriptOp.buildGeometry(stagingData)
         return  # block bound to a non-depth stream — ignore rather than error
 
-    # Resolve the OAK component relative to the bound op (fill runs inside the extension,
-    # so a bare op('TDOAK') would resolve inside the OAK component itself).
-    oakComp = scriptOp.parent().op('TDOAK')
-    k = oakComp.ext.OAKManagerExt.GetIntrinsics(SOCKET) if oakComp else None
+    # `oak` — the OAK component — is injected into every Handler DAT's namespace by the
+    # extension (fill runs inside the extension, where a bare op('TDOAK') would resolve
+    # inside the component itself and return None).
+    k = oak.GetIntrinsics(SOCKET)
     if k is None:
         scriptOp.buildGeometry(stagingData)
         return

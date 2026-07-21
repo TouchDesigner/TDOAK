@@ -83,6 +83,7 @@ class StatusInfo(TypedDict):
 class PipelineConfig(TypedDict):
     device:         str
     fps:            int
+    logLevel:       str         # depthai verbosity: trace/debug/info/warn/error/critical
     enableDepth:    bool
     enableImu:      bool
     pipelineScript: str | None
@@ -858,6 +859,17 @@ class OAKManagerExt:
         self.pushStatus(False, streams=streamNames)
 
         pipeline.start()
+        # Cap the device's log chatter (temperatures, cpu usage, ...) to the configured
+        # verbosity — setLogLevel gates device->host transfer, setLogOutputLevel printing.
+        with suppress(Exception):
+            levels = {'trace': dai.LogLevel.TRACE, 'debug': dai.LogLevel.DEBUG,
+                      'info': dai.LogLevel.INFO, 'warn': dai.LogLevel.WARN,
+                      'error': dai.LogLevel.ERR, 'critical': dai.LogLevel.CRITICAL}
+            level = levels.get(config['logLevel'])
+            if level is not None:
+                dev = pipeline.getDefaultDevice()  # type: ignore[attr-defined]
+                dev.setLogLevel(level)
+                dev.setLogOutputLevel(level)
         self.cacheIntrinsics(pipeline.getDefaultDevice())  # type: ignore[attr-defined]
         with self._lock:
             self._controlQueues = controlQueues
@@ -1406,6 +1418,11 @@ class OAKManagerExt:
         if pipeline is not None:
             with suppress(Exception):
                 pipeline.stop()
+            # Join the pipeline's host-side threads BEFORE touching the device: closing
+            # while its nodes are still processing is a native race that can hard-crash
+            # the process on a plain Stop.
+            with suppress(Exception):
+                pipeline.wait()
         if device is not None:
             with suppress(Exception):
                 device.close()
@@ -1449,9 +1466,12 @@ class OAKManagerExt:
     def execHandler(self, handlerDat: OP, label: str) -> tuple[ParseFn | None, FillFn | None] | None:
         """Main thread. Exec a Handler DAT and return its optional (parse, fill) callables,
         or None when the DAT fails to exec (reported via setError). Compiled with the DAT's
-        path as filename so a handler traceback points at the real DAT, not '<string>'."""
+        path as filename so a handler traceback points at the real DAT, not '<string>'.
+        Besides dai/np, `oak` (the OAK component) is in scope so a fill can reach the
+        promoted API (GetIntrinsics, GetStatus, ...) without guessing paths — fill runs
+        inside the extension, where a bare op('...') would resolve inside the component."""
         import depthai as dai
-        namespace: dict[str, object] = {'dai': dai, 'np': np}
+        namespace: dict[str, object] = {'dai': dai, 'np': np, 'oak': self.ownerComp}
         try:
             exec(compile(handlerDat.text, handlerDat.path, 'exec'), namespace)
         except Exception as exc:
@@ -1468,6 +1488,10 @@ class OAKManagerExt:
         dat = op(datRef) if datRef else None
         rawDevice: str = par.Device.eval().strip()
         device: str = '' if rawDevice in ('', 'None') else rawDevice
+        # Loglevel is an optional custom par (older comps may not have it) — default 'warn'
+        # silences depthai's periodic [info] chatter (temperatures, cpu usage, ...).
+        logPar = getattr(par, 'Loglevel', None)
+        logLevel: str = str(logPar.eval()) if logPar is not None else 'warn'
         # All TD reads happen here on the main thread; the worker (which can't touch TD)
         # gets everything via this config dict.
         projFolder: str = project.folder
@@ -1475,6 +1499,7 @@ class OAKManagerExt:
         return PipelineConfig(
             device=         device,
             fps=            int(par.Fps.eval()),
+            logLevel=       logLevel,
             enableDepth=    bool(par.Enabledepth.eval()),
             enableImu=      bool(par.Enableimu.eval()),
             pipelineScript= dat.text if dat else None,
