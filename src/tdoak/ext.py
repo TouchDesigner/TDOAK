@@ -1,15 +1,31 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import ast
 import math
 import os
 import threading
 import time
+from contextlib import suppress
 from typing import TYPE_CHECKING, Callable, Protocol, TypedDict
 
 import numpy as np
 
 if TYPE_CHECKING:
     from td import COMP, OP, Par, TOP, scriptTOP
+
+
+RECONNECT_DELAY_S    = 10.0   # delay between automatic retry attempts after a pipeline error
+MAX_RETRIES          = 3      # start attempts before giving up until the next Start
+REBUILD_DELAY_FRAMES = 5      # frames between Stop and Start on a Rebuild
+RESTART_POLL_FRAMES  = 15     # re-check cadence while waiting for the previous worker to exit
+MAINTENANCE_PERIOD   = 30     # cooks between autoreload checks + binding-cache rebuilds
+POLL_IDLE_SLEEP_S    = 0.003  # worker sleep after a poll pass that yielded no messages
+DOWNLOAD_POLL_S      = 0.25   # subprocess wait timeout while pre-fetching models
+
+DEFAULT_RGB_RESOLUTION = (1920, 1080)
+IMU_REPORT_RATE_HZ     = 500
+IMU_BATCH_THRESHOLD    = 1
+IMU_MAX_BATCH_REPORTS  = 10
 
 
 class DeviceInfo(TypedDict):
@@ -67,6 +83,7 @@ class PipelineConfig(TypedDict):
     enableDepth:    bool
     enableImu:      bool
     pipelineScript: str | None
+    pipelinePath:   str         # DAT path of the pipeline script, for traceback attribution
     models:         list[str]   # everything the script declares (module-level MODELS): slugs + local paths
     localModels:    list[str]   # subset of models that resolve to a local file → load directly, no zoo prefetch
     cacheDir:       str         # DEPTHAI_ZOO_CACHE_PATH shared by the prefetch subprocess + in-proc build
@@ -102,28 +119,42 @@ FrameData = (np.ndarray | list[DetectionEntry] | list[PoseEntry]
              | list[ExtendedDetectionEntry] | list[ClassificationEntry] | ImuData
              | list[list[float]] | list[list[list[float]]])
 
-# Sentinel: decodeNodeMessage returns this when no depthai-nodes type matched, so the
-# caller falls through to the built-in (raw depthai) decode chain.
-_UNHANDLED: object = object()
-
 # Cached depthai-nodes message classes (or None if depthai-nodes isn't installed). depthai-nodes
 # is optional at runtime, so the import is deferred and memoized — never imported at module load.
 _NODE_TYPES: dict[str, type] | None = None
+
+# Set when depthai-nodes exists but fails to import (broken install ≠ not installed) — surfaced
+# once via setError the first time a message is classified, then cleared.
+_NODE_IMPORT_ERROR: str | None = None
+
+# classifyMessage kinds for the depthai-nodes message family, in match order.
+# ImgDetectionsExtended also exposes .detections, so it must be recognised before the raw
+# dai.ImgDetections duck-type check.
+_NODE_KINDS: tuple[tuple[str, str], ...] = (
+    ('extdet',          'ImgDetectionsExtended'),
+    ('keypoints',       'Keypoints'),
+    ('segmask',         'SegmentationMask'),
+    ('classifications', 'Classifications'),
+    ('lines',           'Lines'),
+    ('clusters',        'Clusters'),
+)
 
 
 def _nodeMessageTypes() -> dict[str, type]:
     """Return {classname: class} for the depthai-nodes message types we decode, or {} if the
     package isn't importable. Imported once on the worker thread; cached for the process."""
-    global _NODE_TYPES
+    global _NODE_TYPES, _NODE_IMPORT_ERROR
     if _NODE_TYPES is None:
-        names = ('ImgDetectionsExtended', 'Keypoints', 'SegmentationMask',
-                 'Classifications', 'Lines', 'Clusters')
+        names = tuple(clsName for _, clsName in _NODE_KINDS)
         mod = None
         for path in ('depthai_nodes.message', 'depthai_nodes'):
             try:
                 mod = __import__(path, fromlist=['*'])
                 break
-            except Exception:
+            except ImportError:
+                continue  # not installed — the node decoders are simply disabled
+            except Exception as exc:
+                _NODE_IMPORT_ERROR = f'depthai_nodes[import]: {exc}'
                 continue
         # Map only the classes this build actually exposes; a missing one just skips its
         # decoder rather than disabling all of them.
@@ -154,41 +185,83 @@ class OAKManagerExt:
     def __init__(self, ownerComp: COMP) -> None:
         self.ownerComp: COMP = ownerComp
         self.ThreadManager: COMP = op.TDResources.ThreadManager
+        self._mainThread: threading.Thread = threading.current_thread()
 
         self._lock:          threading.Lock       = threading.Lock()
         self._frames:        dict[str, FrameData] = {}
+        self._frameVersions: dict[str, int]       = {}  # bumped per push; lets autoPush skip identical re-pushes
         self._connected:     bool                 = False
         self._fps:           float                = 0.0
         self._latencyMs:     float                = 0.0
         self._lastError:     str                  = ''
         self._activeStreams: list[str]            = []
 
-        self._reconnectDelay:    float                                      = 10.0
-        self._retryCount:        int                                        = 0
-        self._stopFlag:          threading.Event                            = threading.Event()
-        self._datVersion:        int | None                                 = None
-        self._latestDevices:     list[DeviceInfo]                          = []
-        self._onDevicesCallback: Callable[[list[DeviceInfo]], None] | None = None
-        self._activePipeline:    _Pipeline | None                           = None
-        self._activeDevice:      _Device | None                             = None
-        self._intrinsics:        dict[str, dict[str, float]]               = {}
-        self._controlQueues:     dict[str, _InputQueue]                    = {}
-        self._fillers:           dict[str, FillFn]                         = {}  # live, keyed by bound op path
-        # Parsers are read by the worker (runPipeline) per message and swapped atomically by the
-        # main thread on a handler reload — keyed by stream name, lock-free (whole-dict reassign).
-        self._parsers:           dict[str, ParseFn]                        = {}
+        self._retryCount:      int             = 0
+        self._stopFlag:        threading.Event = threading.Event()  # replaced per run — see startWhenIdle
+        # Worker-liveness Event: set on enqueue, cleared in cameraPump's finally. Fetched from
+        # a process-lifetime registry in the tdoak package so it SURVIVES extension re-inits —
+        # a fresh instance must still see a previous instance's still-running worker, or a
+        # Start right after reinit races the old device teardown (native crash territory).
+        # Falls back to a private Event when the tdoak package isn't importable.
+        try:
+            import tdoak
+            self._workerAlive: threading.Event = tdoak.workerAliveEvent(ownerComp.path)
+        except Exception:
+            self._workerAlive = threading.Event()
+        self._startRequested:  bool            = False
+        self._datVersion:      int | None      = None
+        self._latestDevices:   list[DeviceInfo] = []
+        self._intrinsics:      dict[str, dict[str, float]] = {}
+        self._controlQueues:   dict[str, _InputQueue]      = {}
+        self._fillers:         dict[str, FillFn]           = {}  # live, keyed by bound op path
+        # Parsers are read lock-free by the worker (runPipeline) each message; the main thread
+        # only ever swaps in a NEW dict under the lock (reference reassignment is atomic) —
+        # published dicts are never mutated in place.
+        self._parsers:         dict[str, ParseFn]          = {}
         # Component-registered handlers (RegisterHandler) live apart from the seq-derived ones so a
         # handler reload (which rebuilds from the Streams sequence) can't clobber them. fillers are
         # keyed by the consumer op's path (one fill per op), parsers by stream (one per queue).
-        self._componentFillers:  dict[str, FillFn]                         = {}
-        self._componentParsers:  dict[str, ParseFn]                        = {}
-        self._handlersVersion:   int | None                                = None  # baseline for auto-reload
-        self._frameSeq:          int                                       = 0
+        self._componentFillers: dict[str, FillFn]  = {}
+        self._componentParsers: dict[str, ParseFn] = {}
+        self._handlersVersion:  int | None         = None  # baseline for auto-reload
+        self._frameSeq:         int                = 0
 
         self._scriptopRegistry: dict[str, list[OP]] = {}
         self._modelProgress:    dict[str, float]     = {}  # zoo slug -> download fraction 0..1
+        self._modelsDone:       bool                 = False
         self._lastStreamNames:  list[str]            = []
         self._lastImageHW:      tuple[int, int] | None = None  # (h, w) of last image frame, for organizing point clouds
+
+        # Streams the worker should decode: bound streams + anything pulled via GetFrame.
+        # None = decode everything (until the first binding rebuild computes a real set).
+        # Swapped whole under the lock; the worker reads the reference lock-free.
+        self._wantedStreams: set[str] | None = None
+        self._pullMarks:     set[str]        = set()  # streams ever requested via GetFrame
+
+        # Cached (stream, op) push targets — see rebuildBindings.
+        self._bindings:       list[tuple[str, OP]] = []
+        self._bindingsDirty:  bool                 = False
+        self._pushedVersions: dict[tuple[str, str], int] = {}  # (op path, stream) -> last pushed version
+        self._refreshTick:    int                  = 0
+        self._topScratch:     dict[tuple[int, int], np.ndarray] = {}  # per-resolution RGBA buffers
+
+        # Built-in decoders by classifyMessage kind — all run on the WORKER thread with a
+        # uniform (msg, name) signature so the pump dispatches through one dict lookup.
+        self._decoders: dict[str, Callable[[object, str], FrameData | None]] = {
+            'extdet':          self.decodeExtendedDetections,
+            'keypoints':       self.decodeKeypoints,
+            'segmask':         self.decodeSegmentationMask,
+            'classifications': self.decodeClassifications,
+            'lines':           self.decodeLines,
+            'clusters':        self.decodeClusters,
+            'detections':      self.decodeDetections,
+            'imu':             self.decodeImu,
+            'pointcloud':      self.decodePointCloud,
+            'image':           self.decodeImage,
+            'raw':             self.decodeRawFrame,
+            'map':             self.decodeMap,
+            'unknown':         self.decodeUnknown,
+        }
 
         # reset parameters to known state
         self.ownerComp.par.Connected = 0
@@ -201,25 +274,44 @@ class OAKManagerExt:
     # ── Public API (main thread only) ────────────────────────────────────
 
     def Start(self) -> None:
-        self._retryCount    = 0
-        self._reconnectDelay = 10.0
+        self._retryCount = 0
         self.doStart()
 
     def doStart(self) -> None:
-        self._stopFlag.clear()
+        """Request a start. Defers (re-polling) while a previous worker is still winding
+        down — device.close() can block for seconds, and racing it with a second pump would
+        let the dying run close the new run's device."""
+        self._startRequested = True
+        self.startWhenIdle()
+
+    def startWhenIdle(self) -> None:
+        if not self._startRequested:
+            return  # Stop() cancelled the pending start while we waited
+        if self._workerAlive.is_set():
+            self._stopFlag.set()  # make sure the old worker is actually on its way out
+            run('args[0].startWhenIdle()', self,
+                delayFrames=RESTART_POLL_FRAMES, fromOP=self.ownerComp)
+            return
+        self._startRequested = False
+        # Fresh Event per run: the old worker keeps polling ITS flag (which stays set), so a
+        # new Start can never un-stop a run that is still winding down.
+        self._stopFlag = threading.Event()
+        self.setError('')
+        self._topScratch.clear()
         config = self.readConfig()
         # Seed the Autoreload baseline to the DAT we're starting with. Otherwise _datVersion
-        # stays at its None sentinel and the first onRefresh tick reads a real hash != None as
-        # an edit, firing a spurious Rebuild() a moment after every Start.
+        # stays at its None sentinel and the first maintenance tick reads a real hash != None
+        # as an edit, firing a spurious Rebuild() a moment after every Start.
         datRef = self.ownerComp.par.Pipelinedat.eval()
         dat    = op(datRef) if datRef else None
-        self._datVersion = self._datContentHash(dat)
+        self._datVersion = self.datContentHash(dat)
         # Load per-stream Handler DATs on the main thread (the worker can't touch ops): parsers
         # are read by the worker, fillers by the main-thread cook side. Both live on the instance
         # so ReloadHandlers() can hot-swap them without restarting the pipeline. Seed the
-        # handlers-version baseline too, so the first onRefresh tick doesn't fire a spurious reload.
+        # handlers-version baseline too, so the first maintenance tick doesn't fire a spurious reload.
         self.applyHandlers(*self.loadStreamHandlers())
         self._handlersVersion = self.handlersContentHash()
+        self.rebuildBindings()
         # Models the pipeline script declares (module-level MODELS = [...]) get pre-fetched on a
         # worker subprocess so the download never holds TD's GIL. Mirror them into the readonly
         # Models sequence here (main thread, the only place TD ops are touchable) so each model
@@ -232,6 +324,7 @@ class OAKManagerExt:
         # them ready immediately; zoo slugs start at 0.0 and fill as the prefetch streams.
         with self._lock:
             self._modelProgress = {m: (1.0 if m in local else 0.0) for m in models}
+        self._modelsDone = False
         self.setupModelBlocks(models)
         task = self.ThreadManager.TDTask(
             target=self.cameraPump,
@@ -240,14 +333,20 @@ class OAKManagerExt:
             ExceptHook=self.onExcept,
             RefreshHook=self.onRefresh,
         )
-        self.ThreadManager.EnqueueTask(task, standalone=True)
+        self._workerAlive.set()  # cleared by the worker in cameraPump's finally
+        try:
+            self.ThreadManager.EnqueueTask(task, standalone=True)
+        except Exception:
+            self._workerAlive.clear()
+            raise
 
     def Stop(self) -> None:
+        self._startRequested = False  # cancel any start still waiting on the old worker
         self._stopFlag.set()
 
     def Rebuild(self) -> None:
         self.Stop()
-        run('args[0].Start()', self, delayFrames=5, fromOP=self.ownerComp)
+        run('args[0].Start()', self, delayFrames=REBUILD_DELAY_FRAMES, fromOP=self.ownerComp)
 
     def ReloadHandlers(self) -> None:
         """Re-load the Streams blocks' Handler DATs and hot-swap parse/fill into the running
@@ -257,6 +356,7 @@ class OAKManagerExt:
         state for the next Start."""
         self.applyHandlers(*self.loadStreamHandlers())
         self._handlersVersion = self.handlersContentHash()
+        self.rebuildBindings()
 
     def applyHandlers(self, seqParsers: dict[str, ParseFn],
                       seqFillers: dict[str, FillFn]) -> None:
@@ -269,10 +369,11 @@ class OAKManagerExt:
             self._parsers = {**seqParsers, **self._componentParsers}
 
     def ListDevices(self, callback: Callable[[list[DeviceInfo]], None] | None = None) -> None:
-        self._onDevicesCallback = callback
         task = self.ThreadManager.TDTask(
             target=self.enumerateDevices,
-            SuccessHook=self.onEnumerateSuccess,
+            # Closure, not instance state: overlapping ListDevices calls each keep their own
+            # callback instead of the newest one hijacking every completion.
+            SuccessHook=lambda: self.onEnumerateSuccess(callback),
             ExceptHook=self.onEnumerateExcept,
         )
         self.ThreadManager.EnqueueTask(task)
@@ -293,16 +394,16 @@ class OAKManagerExt:
             self._scriptopRegistry[streamName] = []
         if scriptop not in self._scriptopRegistry[streamName]:
             self._scriptopRegistry[streamName].append(scriptop)
+        self.rebuildBindings()
 
     def UnregisterScriptop(self, streamName: str, scriptop: OP | None = None) -> None:
         """Remove a registered scriptop. Pass scriptop=None to remove all for the stream."""
         if scriptop is None:
             self._scriptopRegistry.pop(streamName, None)
         elif streamName in self._scriptopRegistry:
-            try:
+            with suppress(ValueError):
                 self._scriptopRegistry[streamName].remove(scriptop)
-            except ValueError:
-                pass
+        self.rebuildBindings()
 
     def RegisterHandler(self, scriptop: OP, streamName: str, handlerDat: OP | None) -> None:
         """Ingest a consumer component's Handler DAT: exec it once and store its optional
@@ -312,30 +413,25 @@ class OAKManagerExt:
         Pass handlerDat=None (or an empty DAT) to drop this op's fill — see UnregisterHandler for
         full removal. Parse is shared per stream (one physical queue): the last component to
         register a parse for a stream wins, and clearing one op's handler leaves it in place."""
-        import depthai as dai
         key = scriptop.path
         if handlerDat is None or not handlerDat.text.strip():
             self._componentFillers.pop(key, None)
             self._fillers.pop(key, None)
             return
-        namespace: dict[str, object] = {'dai': dai, 'np': np}
-        try:
-            exec(handlerDat.text, namespace)
-        except Exception as exc:
-            self.ownerComp.par.Lasterror = f'handler[{key}] load error: {exc}'
-            return
-        fillFn  = namespace.get('fill')
-        parseFn = namespace.get('parse')
-        if callable(fillFn):
-            self._componentFillers[key] = fillFn        # type: ignore[assignment]
-            self._fillers[key]          = fillFn         # type: ignore[assignment]
+        loaded = self.execHandler(handlerDat, key)
+        if loaded is None:
+            return  # exec failed (reported) — keep whatever was registered before
+        parseFn, fillFn = loaded
+        if fillFn is not None:
+            self._componentFillers[key] = fillFn
+            self._fillers[key]          = fillFn
         else:
             self._componentFillers.pop(key, None)
             self._fillers.pop(key, None)
-        if callable(parseFn):
-            self._componentParsers[streamName] = parseFn  # type: ignore[assignment]
+        if parseFn is not None:
+            self._componentParsers[streamName] = parseFn
             with self._lock:                               # atomic swap → worker reads safely
-                self._parsers = {**self._parsers, streamName: parseFn}  # type: ignore[dict-item]
+                self._parsers = {**self._parsers, streamName: parseFn}
 
     def UnregisterHandler(self, scriptop: OP, streamName: str | None = None) -> None:
         """Drop a component's handler. Always removes this op's fill (keyed by op path). If
@@ -347,8 +443,9 @@ class OAKManagerExt:
         if streamName is not None:
             self._componentParsers.pop(streamName, None)
             with self._lock:
-                self._parsers = {**self._parsers}
-                self._parsers.pop(streamName, None)
+                # Build-then-swap: published dicts are never mutated in place — the worker
+                # reads the reference lock-free.
+                self._parsers = {k: v for k, v in self._parsers.items() if k != streamName}
 
     def RegisterComponent(self, scriptop: OP, streamName: str | None = None,
                           handlerDat: OP | None = None) -> None:
@@ -416,7 +513,11 @@ class OAKManagerExt:
             return False
         filler = self._fillers.get(scriptop.path)
         if filler is not None:
-            filler(scriptop, data)
+            try:
+                filler(scriptop, data)
+            except Exception as exc:
+                self.setError(f'fill[{name}]: {exc}')
+                return False
             return True
         if isinstance(scriptop, scriptTOP) and isinstance(data, np.ndarray):
             scriptop.copyNumpyArray(self.prepareTopFrame(data))
@@ -426,17 +527,24 @@ class OAKManagerExt:
     # ── Getters (safe from Script TOP/CHOP cook callbacks) ───────────────
 
     def GetFrame(self, name: str) -> FrameData | None:
-        with self._lock: return self._frames.get(name)
+        with self._lock:
+            if name not in self._pullMarks:
+                # First pull for this stream: remember the interest so the worker keeps
+                # decoding it even without a Streams-block/registry binding.
+                self._pullMarks.add(name)
+                if self._wantedStreams is not None:
+                    self._wantedStreams = self._wantedStreams | {name}
+            return self._frames.get(name)
 
     def GetFrameNames(self) -> list[str]:
         with self._lock: return list(self._frames.keys())
 
-    def GetRgb(self)     -> FrameData | None: return self.GetFrame('rgb')
-    def GetDepth(self)   -> FrameData | None: return self.GetFrame('depth')
-    def GetIrLeft(self)  -> FrameData | None: return self.GetFrame('ir_left')
-    def GetIrRight(self) -> FrameData | None: return self.GetFrame('ir_right')
-    def GetImu(self)     -> FrameData | None: return self.GetFrame('imu')
-    def GetPose(self)    -> FrameData | None: return self.GetFrame('pose')
+    def GetRgb(self)     -> np.ndarray | None:      return self.GetFrame('rgb')       # type: ignore[return-value]
+    def GetDepth(self)   -> np.ndarray | None:      return self.GetFrame('depth')     # type: ignore[return-value]
+    def GetIrLeft(self)  -> np.ndarray | None:      return self.GetFrame('ir_left')   # type: ignore[return-value]
+    def GetIrRight(self) -> np.ndarray | None:      return self.GetFrame('ir_right')  # type: ignore[return-value]
+    def GetImu(self)     -> ImuData | None:         return self.GetFrame('imu')       # type: ignore[return-value]
+    def GetPose(self)    -> list[PoseEntry] | None: return self.GetFrame('pose')      # type: ignore[return-value]
 
     def GetIntrinsics(self, socket: str = 'CAM_A') -> dict[str, float] | None:
         """Return {'fx', 'fy', 'cx', 'cy'} for the given socket at native resolution, or None if not available."""
@@ -521,7 +629,9 @@ class OAKManagerExt:
     # ── Internal push methods (background thread → shared state) ─────────
 
     def pushFrame(self, name: str, data: FrameData) -> None:
-        with self._lock: self._frames[name] = data
+        with self._lock:
+            self._frames[name] = data
+            self._frameVersions[name] = self._frameVersions.get(name, 0) + 1
 
     def pushDevices(self, devices: list[DeviceInfo]) -> None:
         with self._lock: self._latestDevices = devices
@@ -532,13 +642,25 @@ class OAKManagerExt:
         with self._lock:
             self._modelProgress[model] = min(max(frac, 0.0), 1.0)
 
+    def setError(self, msg: str) -> None:
+        """Record an error — the single choke point every error path funnels through.
+        Thread-safe: a worker just records state for onRefresh to mirror into Lasterror;
+        on the main thread the par is also written immediately, because onRefresh only
+        runs while a pump task is alive (errors while stopped must still surface)."""
+        with self._lock:
+            self._lastError = msg
+        if threading.current_thread() is self._mainThread:
+            self.ownerComp.par.Lasterror = msg
+
     def pushStatus(self, connected: bool, fps: float = 0.0, latency: float = 0.0,
-                    error: str = '', streams: list[str] | None = None) -> None:
+                   streams: list[str] | None = None) -> None:
+        """Update connection status. Errors are NOT part of status — they go through
+        setError and persist until the next Start, so a once-a-second fps push can't
+        wipe an error the user hasn't seen yet."""
         with self._lock:
             self._connected = connected
             self._fps       = fps
             self._latencyMs = latency
-            self._lastError = error
             if streams is not None:
                 self._activeStreams = streams
 
@@ -556,30 +678,27 @@ class OAKManagerExt:
             ))
         self.pushDevices(found)
 
-    def onEnumerateSuccess(self) -> None:
+    def onEnumerateSuccess(self, callback: Callable[[list[DeviceInfo]], None] | None = None) -> None:
         devices = self.GetDevices()
         names:  list[str] = [d['mxid']                                      for d in devices]
         labels: list[str] = [f"{d['name'] or d['mxid']}  [{d['protocol']}]" for d in devices]
         names.insert(0, 'None')
         labels.insert(0, '-- Select Device --')
-        self.ownerComp.par.Device.menuNames  = names  or [' ']
-        self.ownerComp.par.Device.menuLabels = labels or ['—']
-        if self._onDevicesCallback:
-            self._onDevicesCallback(devices)
+        self.ownerComp.par.Device.menuNames  = names
+        self.ownerComp.par.Device.menuLabels = labels
+        if callback:
+            callback(devices)
 
     def onEnumerateExcept(self, *args: object) -> None:
         errorMsg: str = str(args[0]) if args else 'Unknown error'
         self.pushDevices([])
-        self.ownerComp.par.Lasterror = errorMsg
+        self.setError(f'devices[enumerate]: {errorMsg}')
 
     def downloadModels(self, config: PipelineConfig, platform: str,
                        stopFlag: threading.Event) -> bool:
         """WORKER thread. Pre-fetch each declared model on a child interpreter so the
-        download holds its OWN GIL, not TD's. Parse depthai's JSON progress
-        ({"download_now", "download_total", "model_name", "log_type": "download"}, emitted
-        ~every 100ms) and push a 0..1 fraction per model. Returns True if every model exited
-        cleanly (so the caller can trust the cache and skip the online check)."""
-        import json
+        download holds its OWN GIL, not TD's. Returns True if every model exited cleanly
+        (so the caller can trust the cache and skip the online check)."""
         import subprocess
         import sys
 
@@ -610,17 +729,56 @@ class OAKManagerExt:
         for model in zooModels:
             if stopFlag.is_set():
                 return False
-            proc = subprocess.Popen(
-                [python, '-c', code, model, platform],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env=env, creationflags=flags,
-            )
-            assert proc.stdout is not None
-            for line in proc.stdout:
+            if not self.fetchModel(python, code, model, platform, env, flags, stopFlag):
+                allOk = False
                 if stopFlag.is_set():
-                    proc.terminate()
-                    proc.wait()
                     return False
+        return allOk
+
+    def fetchModel(self, python: str, code: str, model: str, platform: str,
+                   env: dict[str, str], flags: int, stopFlag: threading.Event) -> bool:
+        """WORKER thread. Run one zoo prefetch on a child interpreter. Its stdout is drained
+        on a side thread so a silently-stalled download can never hang the pump: the wait loop
+        here polls the stop flag and kills the child instead of blocking on its pipe."""
+        import subprocess
+        proc = subprocess.Popen(
+            [python, '-c', code, model, platform],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, env=env, creationflags=flags,
+        )
+        drain = threading.Thread(target=self.drainDownloadProgress,
+                                 args=(proc.stdout, model), daemon=True)
+        drain.start()
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=DOWNLOAD_POLL_S)
+                    break
+                except subprocess.TimeoutExpired:
+                    if stopFlag.is_set():
+                        proc.kill()
+                        proc.wait()
+                        return False
+        finally:
+            if proc.poll() is None:  # left the loop abnormally — never leak the child
+                proc.kill()
+                proc.wait()
+            drain.join(timeout=1.0)
+            if proc.stdout is not None:
+                proc.stdout.close()
+        if proc.returncode == 0:
+            self.setModelProgress(model, 1.0)  # cached archives emit no progress; force full
+            return True
+        self.setError(f'download[{model}]: exit {proc.returncode}')
+        return False
+
+    def drainDownloadProgress(self, stream: object, model: str) -> None:
+        """Prefetch helper thread. Parse depthai's JSON progress lines
+        ({"download_now", "download_total", "log_type": "download"}, emitted ~every 100 ms)
+        into a 0..1 fraction. Best-effort: exits on EOF or when fetchModel closes the pipe."""
+        import json
+        try:
+            for line in stream:  # type: ignore[attr-defined]
                 line = line.strip()
                 if not line.startswith('{'):
                     continue  # depthai's own [info] logs aren't JSON — ignore them
@@ -633,34 +791,34 @@ class OAKManagerExt:
                 total = msg.get('download_total') or 0
                 if total:
                     self.setModelProgress(model, msg.get('download_now', 0) / total)
-            proc.wait()
-            if proc.returncode == 0:
-                self.setModelProgress(model, 1.0)  # cached archives emit no progress; force full
-            else:
-                allOk = False
-                with self._lock:
-                    self._lastError = f'download[{model}] failed (exit {proc.returncode})'
-        return allOk
+        except Exception:
+            pass  # reader raced the pipe close on kill — progress is best-effort
 
     def cameraPump(self, config: PipelineConfig, stopFlag: threading.Event) -> None:
         # Worker entry point. Tear the device down HERE (worker thread) on every exit path:
         # device.close()/pipeline.stop() are blocking depthai calls, and the SuccessHook/
         # ExceptHook run on TD's MAIN thread — closing there freezes the UI for several
         # frames on each stop/retry. The finally keeps that cost off the main thread.
+        # Handles travel through this dict (per-run locals, not instance state) so a dying
+        # run can only ever close its own device — see startWhenIdle.
+        handles: dict[str, object] = {'pipeline': None, 'device': None}
         try:
-            self.runPipeline(config, stopFlag)
+            self.runPipeline(config, stopFlag, handles)
         finally:
-            self.closeActiveDevice()
+            self.closeDevice(handles['pipeline'], handles['device'])  # type: ignore[arg-type]
+            self._workerAlive.clear()
 
-    def runPipeline(self, config: PipelineConfig, stopFlag: threading.Event) -> None:
+    def runPipeline(self, config: PipelineConfig, stopFlag: threading.Event,
+                    handles: dict[str, object]) -> None:
         import depthai as dai
 
         if config['device']:
-            self._activeDevice = dai.Device(dai.DeviceInfo(config['device']))
-            pipeline = dai.Pipeline(self._activeDevice)
+            device = dai.Device(dai.DeviceInfo(config['device']))
+            handles['device'] = device
+            pipeline = dai.Pipeline(device)
         else:
-            self._activeDevice = None
             pipeline = dai.Pipeline()
+        handles['pipeline'] = pipeline
 
         # Pre-fetch declared models on a subprocess (its own interpreter = its own GIL) so the
         # download stays off TD's main thread and we can stream a live progress counter. Then
@@ -671,6 +829,8 @@ class OAKManagerExt:
         # Only trust the cache (skip the online check) when we actually pre-fetched a zoo slug.
         # An all-local pipeline leaves the check on so any incidental zoo resolve still works.
         zooDeclared = any(m not in set(config['localModels']) for m in config['models'])
+        # NOTE: process-global environment — this affects every depthai user in the TD process
+        # and assumes a single OAK component per project (or identical settings across them).
         os.environ['DEPTHAI_ZOO_CACHE_PATH']     = config['cacheDir']
         os.environ['DEPTHAI_ZOO_INTERNET_CHECK'] = '0' if (zooDeclared and prefetched) else '1'
         if stopFlag.is_set():
@@ -679,7 +839,6 @@ class OAKManagerExt:
         queues, streamNames, controlQueues = self.buildPipeline(pipeline, config)
         self.pushStatus(False, streams=streamNames)
 
-        self._activePipeline = pipeline
         pipeline.start()
         self.cacheIntrinsics(pipeline.getDefaultDevice())  # type: ignore[attr-defined]
         with self._lock:
@@ -689,21 +848,25 @@ class OAKManagerExt:
         frameCount: int   = 0
         fpsTimer:   float = time.monotonic()
         tdThread          = threading.current_thread()
+        kinds: dict[str, str] = {}  # stream -> decode kind, classified on the first message
 
         while not stopFlag.is_set() and pipeline.isRunning():
+            got = False
             for name, q in queues.items():
                 msg = q.tryGet()
                 if msg is None:
                     continue
+                got = True
 
-                hostTs:    float = time.monotonic()
-                deviceTs:  float = (msg.getTimestampDevice().total_seconds()  # type: ignore[union-attr]
-                                    if hasattr(msg, 'getTimestampDevice') else hostTs)
-                latencyMs: float = (hostTs - deviceTs) * 1000.0
+                # Skip decoding streams nobody consumes (no binding, never pulled via
+                # GetFrame) — the queue is still drained so the device never backs up.
+                wanted = self._wantedStreams  # whole-set reassign on the main thread → atomic read
+                if wanted is not None and name not in wanted:
+                    continue
 
                 # Custom per-stream decode wins: turn the (model-specific) message into
-                # plain, thread-safe data. Anything not handled here falls through to the
-                # built-in decoders below (the QoL path for rgb/depth/tof/detections/imu).
+                # plain, thread-safe data. Anything without a parse falls through to the
+                # built-in decoders (the QoL path for rgb/depth/tof/detections/imu).
                 # Read self._parsers fresh each message so ReloadHandlers() can hot-swap them
                 # (whole-dict reassign on the main thread → atomic, no torn read) mid-run.
                 parseFn = self._parsers.get(name)
@@ -711,178 +874,203 @@ class OAKManagerExt:
                     try:
                         data = parseFn(msg)
                     except Exception as exc:
-                        with self._lock:
-                            self._lastError = f'parse[{name}]: {exc}'
+                        self.setError(f'parse[{name}]: {exc}')
                         continue
                     if data is not None:
                         self.pushFrame(name, data)
                     continue
 
-                # depthai-nodes typed messages decode first: ImgDetectionsExtended also exposes
-                # .detections, so it must be caught here before the raw dai.ImgDetections branch.
-                nodeData = self.decodeNodeMessage(msg)
-                if nodeData is not _UNHANDLED:
-                    if nodeData is not None:
-                        self.pushFrame(name, nodeData)
+                # A queue's message type never changes in practice, so classify once per
+                # stream and dispatch through a dict lookup thereafter.
+                kind = kinds.get(name)
+                if kind is None:
+                    kind = self.classifyMessage(msg)
+                    kinds[name] = kind
+                try:
+                    data = self._decoders[kind](msg, name)
+                except Exception as exc:
+                    self.setError(f'decode[{type(msg).__name__}]: {exc}')
                     continue
+                if data is not None:
+                    self.pushFrame(name, data)
 
-                if hasattr(msg, 'detections'):
-                    dets = msg.detections  # type: ignore[union-attr]
-                    # Pose models (YOLOv8-pose) carry per-detection keypoints; plain
-                    # object detectors return empty keypoints. Route on that so one
-                    # branch serves both without depending on the stream name.
-                    if dets and dets[0].getKeypoints2f():
-                        edges: list[list[int]] = [list(e) for e in dets[0].getEdges()]
-                        self.pushFrame(name, [
-                            PoseEntry(
-                                confidence= round(d.confidence, 3),
-                                box=        [d.xmin, d.ymin, d.xmax, d.ymax],
-                                keypoints=  [[p.x, p.y] for p in d.getKeypoints2f()],
-                                edges=      edges,
-                            )
-                            for d in dets
-                        ])
-                    else:
-                        self.pushFrame(name, [
-                            DetectionEntry(
-                                label=      d.label,
-                                confidence= round(d.confidence, 3),
-                                xmin=       d.xmin,
-                                ymin=       d.ymin,
-                                xmax=       d.xmax,
-                                ymax=       d.ymax,
-                            )
-                            for d in dets
-                        ])
+                if kind == 'image' and name == 'rgb':
+                    frameCount += 1
+                    now     = time.monotonic()
+                    elapsed = now - fpsTimer
+                    if elapsed >= 1.0:
+                        fps = frameCount / elapsed
+                        # Latency against depthai's own clock — msg timestamps share an
+                        # epoch with dai.Clock.now(), not with host time.monotonic().
+                        try:
+                            latencyMs = (dai.Clock.now()
+                                         - msg.getTimestamp()).total_seconds() * 1000.0  # type: ignore[union-attr]
+                        except Exception:
+                            latencyMs = 0.0
+                        self.pushStatus(True, fps=fps, latency=latencyMs,
+                                        streams=streamNames)
+                        frameCount = 0
+                        fpsTimer   = now
+                        tdThread.SetProgressSafe(  # type: ignore[attr-defined]
+                            min(fps / config['fps'], 1.0) if config['fps'] else 0.5)
 
-                elif hasattr(msg, 'packets'):
-                    if msg.packets:  # type: ignore[union-attr]
-                        p   = msg.packets[-1]  # type: ignore[union-attr]
-                        acc = p.acceleroMeter if hasattr(p, 'acceleroMeter') else p.accelerometer
-                        self.pushFrame(name, ImuData(
-                            accel= [acc.x, acc.y, acc.z],
-                            gyro=  [p.gyroscope.x, p.gyroscope.y, p.gyroscope.z],
-                        ))
+            if not got:
+                # Sleep only when a full pass found nothing: bursts drain at full speed,
+                # while an idle pipeline doesn't spin thousands of wakeups per second.
+                time.sleep(POLL_IDLE_SLEEP_S)
 
-                elif hasattr(msg, 'getPoints'):
-                    # getPoints() may return (N, 3) or a flat (N*3,) array depending on the
-                    # depthai build (3.6.1 returns flat) — normalise to (N, 3) first.
-                    pts: np.ndarray = np.asarray(msg.getPoints(),  # type: ignore[union-attr]
-                                                 dtype=np.float32).reshape(-1, 3)
-                    # Organized cloud → reshape to the sensor grid so it's TOP-ready
-                    # and pixel-aligned with depth/amplitude (flipud to match their origin).
-                    w: int = int(msg.getWidth())  if hasattr(msg, 'getWidth')  else 0  # type: ignore[union-attr]
-                    h: int = int(msg.getHeight()) if hasattr(msg, 'getHeight') else 0  # type: ignore[union-attr]
-                    if w * h != pts.shape[0] and self._lastImageHW is not None:
-                        # getWidth/getHeight unreliable on some builds → fall back to the
-                        # companion ToF image grid (depth/amplitude share the sensor res).
-                        ih, iw = self._lastImageHW
-                        if ih * iw == pts.shape[0]:
-                            h, w = ih, iw
-                    if w > 0 and h > 0 and w * h == pts.shape[0]:
-                        pts = np.flipud(pts.reshape(h, w, 3))
-                    self.pushFrame(name, np.ascontiguousarray(pts))
+    # ── Built-in decoders (WORKER thread, uniform (msg, name) signature) ──
+    # Zero-config defaults keyed off the message type, not the stream name. A per-stream
+    # Handler `parse` always wins over these — they are defaults, not a fixed contract.
 
-                elif hasattr(msg, 'getCvFrame'):
-                    frame: np.ndarray = np.flipud(msg.getCvFrame())  # type: ignore[union-attr]
-                    if name == 'rgb':
-                        frame = frame[..., ::-1]
-                    self._lastImageHW = (frame.shape[0], frame.shape[1])
-                    self.pushFrame(name, np.ascontiguousarray(frame))
-                    if name == 'rgb':
-                        frameCount += 1
-                        elapsed: float = hostTs - fpsTimer
-                        if elapsed >= 1.0:
-                            fps: float = frameCount / elapsed
-                            self.pushStatus(True, fps=fps,
-                                             latency=latencyMs, streams=streamNames)
-                            frameCount = 0
-                            fpsTimer   = hostTs
-                            tdThread.SetProgressSafe(  # type: ignore[attr-defined]
-                                min(fps / config['fps'], 1.0) if config['fps'] else 0.5)
-
-                elif hasattr(msg, 'getFrame'):
-                    self.pushFrame(name, np.ascontiguousarray(msg.getFrame()))  # type: ignore[union-attr]
-
-                elif hasattr(msg, 'map'):
-                    # depthai_nodes Map2D (monocular depth, heatmaps, etc.) → float32 (H, W).
-                    # flipud to match the image streams' TD origin so it overlays the rgb.
-                    arr: np.ndarray = np.asarray(msg.map, dtype=np.float32)  # type: ignore[union-attr]
-                    if arr.ndim >= 2:
-                        self._lastImageHW = (arr.shape[0], arr.shape[1])
-                    self.pushFrame(name, np.ascontiguousarray(np.flipud(arr)))
-
-            time.sleep(0.0002)
-
-    def decodeNodeMessage(self, msg: object) -> object:
-        """WORKER thread. Decode a depthai-nodes typed message into plain, thread-safe data.
-        Returns the payload, None to skip the frame (decode failed — logged to Lasterror), or
-        the _UNHANDLED sentinel when msg isn't a recognised depthai-nodes type (so the caller
-        falls through to the built-in raw-depthai decoders). A per-stream Handler `parse` still
-        wins over this — these are zero-config defaults, not a replacement for custom decode."""
+    def classifyMessage(self, msg: object) -> str:
+        """WORKER thread. Pick the built-in decoder kind for a stream's messages. Called once
+        per stream (on its first message) and memoized by the pump — a queue's message type
+        never changes in practice. depthai-nodes types are checked first: ImgDetectionsExtended
+        also exposes .detections, so it must be recognised before the raw duck-type checks."""
+        global _NODE_IMPORT_ERROR
         types = _nodeMessageTypes()
-        if not types:
-            return _UNHANDLED
+        if _NODE_IMPORT_ERROR:
+            self.setError(_NODE_IMPORT_ERROR)  # broken install ≠ not installed — surface it
+            _NODE_IMPORT_ERROR = None
+        for kind, clsName in _NODE_KINDS:
+            cls = types.get(clsName)
+            if cls is not None and isinstance(msg, cls):
+                return kind
+        if hasattr(msg, 'detections'):  return 'detections'
+        if hasattr(msg, 'packets'):     return 'imu'
+        if hasattr(msg, 'getPoints'):   return 'pointcloud'
+        if hasattr(msg, 'getCvFrame'):  return 'image'
+        if hasattr(msg, 'getFrame'):    return 'raw'
+        if hasattr(msg, 'map'):         return 'map'
+        return 'unknown'
 
-        def isType(name: str) -> bool:
-            cls = types.get(name)
-            return cls is not None and isinstance(msg, cls)
+    def decodeDetections(self, msg: object, name: str) -> list[PoseEntry] | list[DetectionEntry]:
+        dets = msg.detections  # type: ignore[attr-defined]
+        # Pose models (YOLOv8-pose) carry per-detection keypoints; plain object detectors
+        # return empty keypoints. Route on that so one branch serves both without depending
+        # on the stream name.
+        if dets and dets[0].getKeypoints2f():
+            edges: list[list[int]] = [list(e) for e in dets[0].getEdges()]
+            return [
+                PoseEntry(
+                    confidence= round(d.confidence, 3),
+                    box=        [d.xmin, d.ymin, d.xmax, d.ymax],
+                    keypoints=  [[p.x, p.y] for p in d.getKeypoints2f()],
+                    edges=      edges,
+                )
+                for d in dets
+            ]
+        return [
+            DetectionEntry(
+                label=      d.label,
+                confidence= round(d.confidence, 3),
+                xmin=       d.xmin,
+                ymin=       d.ymin,
+                xmax=       d.xmax,
+                ymax=       d.ymax,
+            )
+            for d in dets
+        ]
 
-        try:
-            if isType('ImgDetectionsExtended'):
-                out: list[ExtendedDetectionEntry] = []
-                for d in msg.detections:                       # type: ignore[attr-defined]
-                    box, angle = _rotatedRectBox(d.rotated_rect)
-                    out.append(ExtendedDetectionEntry(
-                        label=      int(d.label),
-                        confidence= round(float(d.confidence), 3),
-                        box=        box,
-                        angle=      angle,
-                        keypoints=  [[float(k.x), float(k.y), float(getattr(k, 'confidence', 1.0))]
-                                     for k in getattr(d, 'keypoints', [])],
-                    ))
-                return out
-
-            if isType('Keypoints'):
-                return [[float(k.x), float(k.y), float(getattr(k, 'confidence', 1.0))]
-                        for k in msg.keypoints]                 # type: ignore[attr-defined]
-
-            if isType('SegmentationMask'):
-                # int class-index map, -1 = background → clamp to 0 and coerce to a TOP-friendly
-                # uint. flipud to match the image streams' TD origin so it overlays the rgb.
-                mask = np.asarray(msg.mask)                     # type: ignore[attr-defined]
-                mask = np.where(mask < 0, 0, mask).astype(np.uint16)
-                if mask.ndim >= 2:
-                    self._lastImageHW = (mask.shape[0], mask.shape[1])
-                return np.ascontiguousarray(np.flipud(mask))
-
-            if isType('Classifications'):
-                return [ClassificationEntry(label=str(c), score=round(float(s), 4))
-                        for c, s in zip(msg.classes, msg.scores)]  # type: ignore[attr-defined]
-
-            if isType('Lines'):
-                return [[float(ln.start_point.x), float(ln.start_point.y),
-                         float(ln.end_point.x),   float(ln.end_point.y),
-                         float(getattr(ln, 'confidence', 1.0))]
-                        for ln in msg.lines]                    # type: ignore[attr-defined]
-
-            if isType('Clusters'):
-                return [[[float(p.x), float(p.y)] for p in cl.points]
-                        for cl in msg.clusters]                 # type: ignore[attr-defined]
-        except Exception as exc:
-            with self._lock:
-                self._lastError = f'decode[{type(msg).__name__}]: {exc}'
+    def decodeImu(self, msg: object, name: str) -> ImuData | None:
+        if not msg.packets:  # type: ignore[attr-defined]
             return None
-        return _UNHANDLED
+        p   = msg.packets[-1]  # type: ignore[attr-defined]
+        acc = p.acceleroMeter if hasattr(p, 'acceleroMeter') else p.accelerometer
+        return ImuData(
+            accel= [acc.x, acc.y, acc.z],
+            gyro=  [p.gyroscope.x, p.gyroscope.y, p.gyroscope.z],
+        )
+
+    def decodePointCloud(self, msg: object, name: str) -> np.ndarray:
+        # getPoints() may return (N, 3) or a flat (N*3,) array depending on the
+        # depthai build (3.6.1 returns flat) — normalise to (N, 3) first.
+        pts: np.ndarray = np.asarray(msg.getPoints(),  # type: ignore[attr-defined]
+                                     dtype=np.float32).reshape(-1, 3)
+        # Organized cloud → reshape to the sensor grid so it's TOP-ready
+        # and pixel-aligned with depth/amplitude (flipud to match their origin).
+        w: int = int(msg.getWidth())  if hasattr(msg, 'getWidth')  else 0  # type: ignore[attr-defined]
+        h: int = int(msg.getHeight()) if hasattr(msg, 'getHeight') else 0  # type: ignore[attr-defined]
+        if w * h != pts.shape[0] and self._lastImageHW is not None:
+            # getWidth/getHeight unreliable on some builds → fall back to the
+            # companion ToF image grid (depth/amplitude share the sensor res).
+            ih, iw = self._lastImageHW
+            if ih * iw == pts.shape[0]:
+                h, w = ih, iw
+        if w > 0 and h > 0 and w * h == pts.shape[0]:
+            pts = np.flipud(pts.reshape(h, w, 3))
+        return np.ascontiguousarray(pts)
+
+    def decodeImage(self, msg: object, name: str) -> np.ndarray:
+        frame: np.ndarray = np.flipud(msg.getCvFrame())  # type: ignore[attr-defined]
+        if name == 'rgb':
+            frame = frame[..., ::-1]
+        self._lastImageHW = (frame.shape[0], frame.shape[1])
+        return np.ascontiguousarray(frame)
+
+    def decodeRawFrame(self, msg: object, name: str) -> np.ndarray:
+        return np.ascontiguousarray(msg.getFrame())  # type: ignore[attr-defined]
+
+    def decodeMap(self, msg: object, name: str) -> np.ndarray:
+        # depthai_nodes Map2D (monocular depth, heatmaps, etc.) → float32 (H, W).
+        # flipud to match the image streams' TD origin so it overlays the rgb.
+        arr: np.ndarray = np.asarray(msg.map, dtype=np.float32)  # type: ignore[attr-defined]
+        if arr.ndim >= 2:
+            self._lastImageHW = (arr.shape[0], arr.shape[1])
+        return np.ascontiguousarray(np.flipud(arr))
+
+    def decodeUnknown(self, msg: object, name: str) -> None:
+        return None  # unrecognised message type — drained but not decoded
+
+    def decodeExtendedDetections(self, msg: object, name: str) -> list[ExtendedDetectionEntry]:
+        out: list[ExtendedDetectionEntry] = []
+        for d in msg.detections:                       # type: ignore[attr-defined]
+            box, angle = _rotatedRectBox(d.rotated_rect)
+            out.append(ExtendedDetectionEntry(
+                label=      int(d.label),
+                confidence= round(float(d.confidence), 3),
+                box=        box,
+                angle=      angle,
+                keypoints=  [[float(k.x), float(k.y), float(getattr(k, 'confidence', 1.0))]
+                             for k in getattr(d, 'keypoints', [])],
+            ))
+        return out
+
+    def decodeKeypoints(self, msg: object, name: str) -> list[list[float]]:
+        return [[float(k.x), float(k.y), float(getattr(k, 'confidence', 1.0))]
+                for k in msg.keypoints]                 # type: ignore[attr-defined]
+
+    def decodeSegmentationMask(self, msg: object, name: str) -> np.ndarray:
+        # int class-index map, -1 = background → clamp to 0 and coerce to a TOP-friendly
+        # uint. flipud to match the image streams' TD origin so it overlays the rgb.
+        mask = np.asarray(msg.mask)                     # type: ignore[attr-defined]
+        mask = np.where(mask < 0, 0, mask).astype(np.uint16)
+        if mask.ndim >= 2:
+            self._lastImageHW = (mask.shape[0], mask.shape[1])
+        return np.ascontiguousarray(np.flipud(mask))
+
+    def decodeClassifications(self, msg: object, name: str) -> list[ClassificationEntry]:
+        return [ClassificationEntry(label=str(c), score=round(float(s), 4))
+                for c, s in zip(msg.classes, msg.scores)]  # type: ignore[attr-defined]
+
+    def decodeLines(self, msg: object, name: str) -> list[list[float]]:
+        return [[float(ln.start_point.x), float(ln.start_point.y),
+                 float(ln.end_point.x),   float(ln.end_point.y),
+                 float(getattr(ln, 'confidence', 1.0))]
+                for ln in msg.lines]                    # type: ignore[attr-defined]
+
+    def decodeClusters(self, msg: object, name: str) -> list[list[list[float]]]:
+        return [[[float(p.x), float(p.y)] for p in cl.points]
+                for cl in msg.clusters]                 # type: ignore[attr-defined]
 
     def cacheIntrinsics(self, device: object) -> None:
-        import depthai as dai
         result: dict[str, dict[str, float]] = {}
-        try:
+        with suppress(Exception):
             calib = device.readCalibration()  # type: ignore[union-attr]
             for feat in device.getConnectedCameraFeatures():  # type: ignore[union-attr]
                 key = str(feat.socket).split('.')[-1]
-                try:
+                with suppress(Exception):
                     mat: list[list[float]] = calib.getCameraIntrinsics(feat.socket)
                     result[key] = {
                         'fx': mat[0][0],
@@ -890,10 +1078,6 @@ class OAKManagerExt:
                         'cx': mat[0][2],
                         'cy': mat[1][2],
                     }
-                except Exception:
-                    pass
-        except Exception:
-            pass
         with self._lock:
             self._intrinsics = result
 
@@ -904,40 +1088,43 @@ class OAKManagerExt:
 
         if config['pipelineScript']:
             namespace: dict[str, object] = {'dai': dai}
-            exec(config['pipelineScript'], namespace)
-            build_fn = namespace.get('build')
-            if not build_fn:
+            # compile() with the DAT's path so a build() traceback points at the real DAT,
+            # not '<string>'.
+            exec(compile(config['pipelineScript'],
+                         config['pipelinePath'] or '<pipeline>', 'exec'), namespace)
+            buildFn = namespace.get('build')
+            if not buildFn:
                 raise RuntimeError(
                     "pipeline.py must define: def build(pipeline) -> ({name: queue}, [stream_names])")
-            result = build_fn(pipeline)  # type: ignore[operator]
+            result = buildFn(pipeline)  # type: ignore[operator]
             if len(result) == 3:
                 queues, streams, controls = result
             else:
                 queues, streams = result
-                controls: dict[str, _InputQueue] = {}
+                controls = {}
             return queues, streams, controls
 
         queues:   dict[str, _OutputQueue] = {}
         streams:  list[str]               = []
         controls: dict[str, _InputQueue]  = {}
 
-        device        = pipeline.getDefaultDevice()  # type: ignore[attr-defined]
-        cam_features  = device.getConnectedCameraFeatures()
-        primary_types = [
-            f.supportedTypes for f in cam_features
+        device       = pipeline.getDefaultDevice()  # type: ignore[attr-defined]
+        camFeatures  = device.getConnectedCameraFeatures()
+        primaryTypes = [
+            f.supportedTypes for f in camFeatures
             if f.socket == dai.CameraBoardSocket.CAM_A
         ]
-        is_tof = bool(primary_types and dai.CameraSensorType.TOF in primary_types[0])
+        isTof = bool(primaryTypes and dai.CameraSensorType.TOF in primaryTypes[0])
 
-        if is_tof:
-            tof_node = pipeline.create(dai.node.ToF).build(dai.CameraBoardSocket.CAM_A)  # type: ignore[attr-defined,union-attr]
-            queues['depth'] = tof_node.depth.createOutputQueue()
+        if isTof:
+            tofNode = pipeline.create(dai.node.ToF).build(dai.CameraBoardSocket.CAM_A)  # type: ignore[attr-defined,union-attr]
+            queues['depth'] = tofNode.depth.createOutputQueue()
             streams.append('depth')
-            controls['tof_cfg'] = tof_node.tofBaseInputConfig.createInputQueue(maxSize=1, blocking=False)  # type: ignore[attr-defined]
+            controls['tof_cfg'] = tofNode.tofBaseInputConfig.createInputQueue(maxSize=1, blocking=False)  # type: ignore[attr-defined]
         else:
-            cam     = pipeline.create(dai.node.Camera).build()
-            rgb_out = cam.requestOutput((1920, 1080), type=dai.ImgFrame.Type.BGR888p)
-            queues['rgb'] = rgb_out.createOutputQueue()
+            cam    = pipeline.create(dai.node.Camera).build()
+            rgbOut = cam.requestOutput(DEFAULT_RGB_RESOLUTION, type=dai.ImgFrame.Type.BGR888p)
+            queues['rgb'] = rgbOut.createOutputQueue()
             streams.append('rgb')
             controls['cam_ctrl'] = cam.inputControl.createInputQueue(maxSize=1, blocking=False)  # type: ignore[attr-defined]
 
@@ -958,9 +1145,9 @@ class OAKManagerExt:
                 imu.enableIMUSensor([
                     dai.IMUSensor.ACCELEROMETER_RAW,
                     dai.IMUSensor.GYROSCOPE_RAW,
-                ], reportRate=500)
-                imu.setBatchReportThreshold(1)
-                imu.setMaxBatchReports(10)
+                ], reportRate=IMU_REPORT_RATE_HZ)
+                imu.setBatchReportThreshold(IMU_BATCH_THRESHOLD)
+                imu.setMaxBatchReports(IMU_MAX_BATCH_REPORTS)
                 queues['imu'] = imu.out.createOutputQueue()
                 streams.append('imu')
 
@@ -989,7 +1176,10 @@ class OAKManagerExt:
 
     def updateModelProgress(self) -> None:
         """Main thread. Mirror the worker's per-model download fractions into each Models
-        block's Progress par, matched by the block's Model name."""
+        block's Progress par, matched by the block's Model name. Stops scanning the sequence
+        once every model reports complete."""
+        if self._modelsDone:
+            return
         seq = getattr(self.ownerComp.seq, 'Models', None)
         if seq is None or len(seq) == 0:
             return
@@ -1001,6 +1191,8 @@ class OAKManagerExt:
             frac = progress.get(seq.blockPars.Model[i].eval())
             if frac is not None:
                 seq.blockPars.Progress[i].val = frac
+        if all(f >= 1.0 for f in progress.values()):
+            self._modelsDone = True
 
     def updateStreamMenus(self, streamNames: list[str]) -> None:
         """Update the Stream menu on block[0]; TD propagates to all other blocks."""
@@ -1013,31 +1205,56 @@ class OAKManagerExt:
         seq.blockPars.Stream[0].menuNames  = streamNames
         seq.blockPars.Stream[0].menuLabels = streamNames
 
-    def pushToScriptops(self) -> None:
-        """Auto-push the latest frame to every bound scriptop (sequential block + registry).
-        Script TOPs and Script CHOPs support 'Modify Outside of Cook', so we push into them
-        from here. Script SOPs have no such toggle — geometry must be built inside the cook,
-        so a SOP pulls instead: call FillScriptOp(me) from its onCook."""
+    def rebuildBindings(self) -> None:
+        """Main thread. Cache the (stream, op) push targets from the Streams sequence and the
+        runtime registry — walking the sequence pars every cook is measurable, so pushToScriptops
+        iterates this cache instead. Rebuilt immediately by register/reload calls and every
+        MAINTENANCE_PERIOD cooks (catching direct par edits). Also derives the wanted-stream set
+        the worker uses to skip decoding streams nobody consumes ('rgb' is always kept — it
+        drives the Fps readout)."""
+        bindings: list[tuple[str, OP]] = []
         seq = getattr(self.ownerComp.seq, 'Streams', None)
         if seq is not None:
             for i in range(len(seq)):
-                streamName: str     = seq.blockPars.Stream[i].eval()
+                streamName: str       = seq.blockPars.Stream[i].eval()
                 targetOp:   OP | None = seq.blockPars.Scriptop[i].eval()
-                if not streamName or targetOp is None:
-                    continue
-                self.autoPush(streamName, targetOp,
-                               self._fillers.get(targetOp.path))
-
-        # Runtime-registered scriptops carry their fill (if any) under their op path, set by
-        # RegisterHandler — so a registered TOP/CHOP with a component handler still pushes.
-        for streamName, opList in list(self._scriptopRegistry.items()):
+                if streamName and targetOp is not None:
+                    bindings.append((streamName, targetOp))
+        for streamName, opList in self._scriptopRegistry.items():
             for targetOp in opList:
-                self.autoPush(streamName, targetOp, self._fillers.get(targetOp.path))
+                if (streamName, targetOp) not in bindings:
+                    bindings.append((streamName, targetOp))
+        self._bindings = bindings
+        wanted = {name for name, _ in bindings} | {'rgb'}
+        with self._lock:
+            # Streams with a registered parse count as consumed too — a handler was
+            # deliberately attached, so its stream must keep decoding.
+            wanted |= self._pullMarks | set(self._parsers)
+            self._wantedStreams = wanted
+
+    def pushToScriptops(self) -> None:
+        """Auto-push the latest frame to every bound scriptop (cached — see rebuildBindings).
+        Script TOPs and Script CHOPs support 'Modify Outside of Cook', so we push into them
+        from here. Script SOPs have no such toggle — geometry must be built inside the cook,
+        so a SOP pulls instead: call FillScriptOp(me) from its onCook."""
+        for streamName, targetOp in self._bindings:
+            if not targetOp.valid:
+                self._bindingsDirty = True  # op deleted — rebuild the cache next tick
+                continue
+            self.autoPush(streamName, targetOp, self._fillers.get(targetOp.path))
 
     def autoPush(self, streamName: str, targetOp: OP, filler: FillFn | None) -> None:
-        data = self.GetFrame(streamName)
+        with self._lock:
+            data    = self._frames.get(streamName)
+            version = self._frameVersions.get(streamName, 0)
         if data is None:
             return
+        # Skip identical re-pushes: only write when the worker has published a new frame
+        # since this op last got one (camera fps below the cook rate makes that most cooks).
+        verKey = (targetOp.path, streamName)
+        if self._pushedVersions.get(verKey) == version:
+            return
+        self._pushedVersions[verKey] = version
         if filler is not None:
             # Script TOP/CHOP ('Modify Outside of Cook') and DATs can be written from here.
             # Script SOPs cannot — geometry must be built in the cook, so a SOP pulls via
@@ -1045,33 +1262,41 @@ class OAKManagerExt:
             if targetOp.family == 'SOP':
                 return
             modPar = getattr(targetOp.par, 'modoutsidecook', None)
-            if modPar is not None:
+            if modPar is not None and not modPar.eval():
                 modPar.val = True
             try:
                 filler(targetOp, data)
             except Exception as exc:
-                self.ownerComp.par.Lasterror = f'fill[{streamName}]: {exc}'
+                self.setError(f'fill[{streamName}]: {exc}')
             return
         # No custom fill: default numpy -> Script TOP only. Non-array defaults
         # (detections/pose/imu) and Script CHOP/SOPs are pulled, not pushed.
         if isinstance(targetOp, scriptTOP) and isinstance(data, np.ndarray):
-            targetOp.par.modoutsidecook = True
+            if not targetOp.par.modoutsidecook.eval():
+                targetOp.par.modoutsidecook = True
             targetOp.copyNumpyArray(self.prepareTopFrame(data))
 
     def prepareTopFrame(self, frame: np.ndarray) -> np.ndarray:
+        """Main thread. Shape a decoded array for scriptTOP.copyNumpyArray without avoidable
+        allocations: 2D → (H, W, 1) view; uint8 RGB → RGBA via a cached per-resolution scratch
+        buffer (copyNumpyArray copies synchronously, so reusing the buffer across pushes and
+        streams is safe)."""
         if frame.ndim == 2:
-            h, w = frame.shape
-            out = np.empty((h, w, 1), dtype=frame.dtype)
-            out[:, :, 0] = frame
-            return out
+            return frame.reshape(frame.shape[0], frame.shape[1], 1)
         if frame.ndim == 3 and frame.shape[2] == 3 and frame.dtype == np.uint8:
-            alpha = np.full(frame.shape[:2], 255, dtype=np.uint8)
-            return np.ascontiguousarray(np.dstack([frame, alpha]))
+            key = (frame.shape[0], frame.shape[1])
+            buf = self._topScratch.get(key)
+            if buf is None:
+                buf = np.empty((key[0], key[1], 4), dtype=np.uint8)
+                buf[:, :, 3] = 255
+                self._topScratch[key] = buf
+            buf[:, :, :3] = frame
+            return buf
         return np.ascontiguousarray(frame)
 
     # ── Thread Manager hooks (main thread) ────────────────────────────────
 
-    def _datContentHash(self, dat: OP | None) -> int | None:
+    def datContentHash(self, dat: OP | None) -> int | None:
         """Hash of a DAT's contents, used to detect edits for Autoreload. ``dat.text``
         covers both Text and Table DATs (tables come back tab-delimited). Returns None
         when there's no DAT, which never compares equal to a real content hash."""
@@ -1098,45 +1323,58 @@ class OAKManagerExt:
         return hash(tuple(parts))
 
     def onRefresh(self) -> None:
-        if self.ownerComp.par.Autoreload.eval():
-            datRef: str = self.ownerComp.par.Pipelinedat.eval()
-            if datRef:
-                dat = op(datRef)
-                version = self._datContentHash(dat)
-                if dat and version != self._datVersion:
-                    self._datVersion = version
-                    self.Rebuild()           # pipeline build() changed → full restart
-                    return
-            # Streams blocks / bindings / Handler DATs changed → hot-reload only, no device restart.
-            handlersVersion = self.handlersContentHash()
-            if handlersVersion != self._handlersVersion:
-                self._handlersVersion = handlersVersion
-                self.ReloadHandlers()
+        # Throttled maintenance: hashing the pipeline DAT + every Handler DAT and walking the
+        # Streams sequence are per-cook costs that exist only to catch rare edits — every
+        # MAINTENANCE_PERIOD cooks (~0.5 s) is plenty, and register/reload calls rebuild the
+        # binding cache immediately anyway.
+        self._refreshTick += 1
+        if self._refreshTick >= MAINTENANCE_PERIOD or self._bindingsDirty:
+            self._refreshTick   = 0
+            self._bindingsDirty = False
+            if self.ownerComp.par.Autoreload.eval():
+                datRef: str = self.ownerComp.par.Pipelinedat.eval()
+                if datRef:
+                    dat = op(datRef)
+                    version = self.datContentHash(dat)
+                    if dat and version != self._datVersion:
+                        self._datVersion = version
+                        self.Rebuild()           # pipeline build() changed → full restart
+                        return
+                # Streams blocks / bindings / Handler DATs changed → hot-reload only, no device restart.
+                handlersVersion = self.handlersContentHash()
+                if handlersVersion != self._handlersVersion:
+                    self._handlersVersion = handlersVersion
+                    self.ReloadHandlers()
+            self.rebuildBindings()
 
         status = self.GetStatus()
-        self.ownerComp.par.Connected     = 1 if status['connected'] else 0
-        self.ownerComp.par.Fps           = round(status['fps'], 1)
-        self.ownerComp.par.Activestreams = ', '.join(status['streams'])
-        self.ownerComp.par.Lasterror     = status['error']
+        par    = self.ownerComp.par
+        connected = 1 if status['connected'] else 0
+        fps       = round(status['fps'], 1)
+        streams   = ', '.join(status['streams'])
+        # Compare before set — a par write per cook is wasted work when nothing changed.
+        if par.Connected.eval() != connected:
+            par.Connected = connected
+        if par.Fps.eval() != fps:
+            par.Fps = fps
+        if par.Activestreams.eval() != streams:
+            par.Activestreams = streams
+        if par.Lasterror.eval() != status['error']:
+            par.Lasterror = status['error']
         self.updateStreamMenus(status['streams'])
         self.updateModelProgress()
         self.pushToScriptops()
 
-    def closeActiveDevice(self) -> None:
-        """Release the active pipeline + device handle. Safe to call on any path
-        (success or failure); guarded so a half-built pipeline can't crash teardown."""
-        if self._activePipeline is not None:
-            try:
-                self._activePipeline.stop()
-            except Exception:
-                pass
-            self._activePipeline = None
-        if self._activeDevice is not None:
-            try:
-                self._activeDevice.close()
-            except Exception:
-                pass
-            self._activeDevice = None
+    def closeDevice(self, pipeline: _Pipeline | None, device: _Device | None) -> None:
+        """WORKER thread (cameraPump's finally). Release one run's pipeline + device handles.
+        They arrive as per-run locals — never read from instance state — so a dying run can
+        only ever close its own device. Safe on a half-built pipeline."""
+        if pipeline is not None:
+            with suppress(Exception):
+                pipeline.stop()
+        if device is not None:
+            with suppress(Exception):
+                device.close()
         with self._lock:
             self._intrinsics    = {}
             self._controlQueues = {}
@@ -1151,62 +1389,114 @@ class OAKManagerExt:
         # Device already released on the worker (cameraPump's finally), so the retry can't
         # reopen a still-open (PoE) handle. Don't close here — this hook is on the main thread.
         errorMsg: str = str(args[0]) if args else 'Unknown error'
-        self._retryCount += 1
+        self.pushStatus(False)
 
-        if self._retryCount >= 3:
-            finalMsg = f'Pipeline failed after 3 attempts — press Start to retry. Last error: {errorMsg}'
-            self.pushStatus(False, error=finalMsg)
-            self.ownerComp.par.Lasterror = finalMsg
+        if self._stopFlag.is_set():
+            # Stop was pressed while the pipeline was failing — honor it, no retry.
+            self.setError(errorMsg)
             return
 
-        self.pushStatus(False, error=errorMsg)
-        self.ownerComp.par.Lasterror = errorMsg
-        delayFrames: int = int(self._reconnectDelay * me.time.rate)
+        self._retryCount += 1
+        if self._retryCount >= MAX_RETRIES:
+            self.setError(f'Pipeline failed after {MAX_RETRIES} attempts — '
+                          f'press Start to retry. Last error: {errorMsg}')
+            return
+
+        self.setError(errorMsg)
+        delayFrames: int = int(RECONNECT_DELAY_S * self.ownerComp.time.rate)
         run('args[0].doStart()', self, delayFrames=delayFrames, fromOP=self.ownerComp)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
+    def execHandler(self, handlerDat: OP, label: str) -> tuple[ParseFn | None, FillFn | None] | None:
+        """Main thread. Exec a Handler DAT and return its optional (parse, fill) callables,
+        or None when the DAT fails to exec (reported via setError). Compiled with the DAT's
+        path as filename so a handler traceback points at the real DAT, not '<string>'."""
+        import depthai as dai
+        namespace: dict[str, object] = {'dai': dai, 'np': np}
+        try:
+            exec(compile(handlerDat.text, handlerDat.path, 'exec'), namespace)
+        except Exception as exc:
+            self.setError(f'handler[{label}]: {exc}')
+            return None
+        parseFn = namespace.get('parse')
+        fillFn  = namespace.get('fill')
+        return (parseFn if callable(parseFn) else None,   # type: ignore[return-value]
+                fillFn  if callable(fillFn)  else None)
+
     def readConfig(self) -> PipelineConfig:
-        par    = self.ownerComp.par
+        par = self.ownerComp.par
         datRef: str = par.Pipelinedat.eval()
-        raw_device: str = par.Device.eval().strip()
-        device: str = '' if raw_device in ('', 'None') else raw_device
-        # project.folder is the .toe directory — depthai's default cache already lands in its
-        # .depthai_cached_models, and the venv sits beside it; both read on the main thread here
-        # so the worker (which can't touch TD) gets them via config.
+        dat = op(datRef) if datRef else None
+        rawDevice: str = par.Device.eval().strip()
+        device: str = '' if rawDevice in ('', 'None') else rawDevice
+        # All TD reads happen here on the main thread; the worker (which can't touch TD)
+        # gets everything via this config dict.
         projFolder: str = project.folder
+        venvSub = ('Scripts', 'python.exe') if os.name == 'nt' else ('bin', 'python')
         return PipelineConfig(
             device=         device,
             fps=            int(par.Fps.eval()),
             enableDepth=    bool(par.Enabledepth.eval()),
             enableImu=      bool(par.Enableimu.eval()),
-            pipelineScript= op(datRef).text if datRef else None,
-            models=         [],  # filled in doStart via readPipelineModels()
-            localModels=    [],  # filled in doStart via localModels()
+            pipelineScript= dat.text if dat else None,
+            pipelinePath=   dat.path if dat else '',
+            models=         [],  # filled in startWhenIdle via readPipelineModels()
+            localModels=    [],  # filled in startWhenIdle via localModels()
             cacheDir=       os.path.join(projFolder, '.depthai_cached_models'),
-            venvPython=     os.path.join(projFolder, '.venv', 'Scripts', 'python.exe'),
+            venvPython=     os.path.join(projFolder, '.venv', *venvSub),
         )
 
     def readPipelineModels(self, config: PipelineConfig) -> list[str]:
-        """Main thread. Extract the zoo slugs a pipeline script declares via a module-level
-        ``MODELS = [...]`` (a bare ``MODEL = '...'`` is also accepted). The script is exec'd in
-        a throwaway namespace — by convention the heavy work lives in build(), so module level
-        is cheap. Returns [] on any error (the build then just resolves models online itself)."""
+        """Main thread. Statically extract the models a pipeline script declares via a
+        module-level ``MODELS = [...]`` (a bare ``MODEL = '...'`` is also accepted). The script
+        is parsed with ast — never exec'd — so the scan has no side effects, can't run
+        module-level code a second time, and needs no namespace seeding. Name references
+        between module-level assignments (``MODELS = [MODEL_A, MODEL_B]``) are resolved;
+        anything computed is skipped (build() then just resolves it inline)."""
         script = config['pipelineScript']
         if not script:
             return []
-        namespace: dict[str, object] = {}
         try:
-            exec(script, namespace)
-        except Exception as exc:
-            self.ownerComp.par.Lasterror = f'model scan error: {exc}'
+            tree = ast.parse(script)
+        except SyntaxError as exc:
+            self.setError(f'models[scan]: {exc}')
             return []
-        decl = namespace.get('MODELS', namespace.get('MODEL'))
+        env: dict[str, object] = {}
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                value   = node.value
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                targets = [node.target.id]
+                value   = node.value
+            else:
+                continue
+            if not targets or value is None:
+                continue
+            try:
+                resolved = self.resolveLiteral(value, env)
+            except ValueError:
+                continue  # computed value — not statically resolvable
+            for name in targets:
+                env[name] = resolved
+        decl = env.get('MODELS', env.get('MODEL'))
         if isinstance(decl, str):
             decl = [decl]
         if not isinstance(decl, (list, tuple)):
             return []
         return [str(m) for m in decl if m]
+
+    def resolveLiteral(self, node: ast.expr, env: dict[str, object]) -> object:
+        """Literal value of an ast expression, resolving Name references from previously
+        assigned module-level values. Raises ValueError for anything non-literal."""
+        if isinstance(node, ast.Name):
+            if node.id in env:
+                return env[node.id]
+            raise ValueError(node.id)
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return [self.resolveLiteral(e, env) for e in node.elts]
+        return ast.literal_eval(node)
 
     def localModels(self, entries: list[str]) -> set[str]:
         """Main thread. Entries that resolve to an existing file (absolute, or relative to the
@@ -1230,31 +1520,28 @@ class OAKManagerExt:
         a stream has a single parse (if two blocks on the same stream both define one, the
         last loaded wins). fill is keyed by the block's bound Scriptop path — the same key the
         component path (RegisterHandler) uses — so a block with no Scriptop set carries no fill."""
-        import depthai as dai
         parsers: dict[str, ParseFn] = {}
         fillers: dict[str, FillFn]  = {}
         seq = getattr(self.ownerComp.seq, 'Streams', None)
         if seq is None:
             return parsers, fillers
+        try:
+            seq.blockPars.Handler
+            hasHandler = True
+        except Exception:
+            hasHandler = False  # Handler param not added on this build → defaults only
         for i in range(len(seq)):
             streamName: str = seq.blockPars.Stream[i].eval()
-            try:
-                handlerDat = seq.blockPars.Handler[i].eval()
-            except Exception:
-                return parsers, fillers  # Handler param not added yet → defaults only
+            handlerDat = seq.blockPars.Handler[i].eval() if hasHandler else None
             if not streamName or handlerDat is None:
                 continue
-            namespace: dict[str, object] = {'dai': dai, 'np': np}
-            try:
-                exec(handlerDat.text, namespace)
-            except Exception as exc:
-                self.ownerComp.par.Lasterror = f'handler[{streamName}#{i}] load error: {exc}'
-                continue
-            parseFn = namespace.get('parse')
-            fillFn  = namespace.get('fill')
-            if callable(parseFn):
-                parsers[streamName] = parseFn  # type: ignore[assignment]
+            loaded = self.execHandler(handlerDat, f'{streamName}#{i}')
+            if loaded is None:
+                continue  # exec failed (reported) — this block keeps the built-in defaults
+            parseFn, fillFn = loaded
+            if parseFn is not None:
+                parsers[streamName] = parseFn
             regOp = seq.blockPars.Scriptop[i].eval()
-            if callable(fillFn) and regOp is not None:
-                fillers[regOp.path] = fillFn  # type: ignore[assignment]
+            if fillFn is not None and regOp is not None:
+                fillers[regOp.path] = fillFn
         return parsers, fillers

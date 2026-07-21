@@ -1,8 +1,15 @@
 # data Script CHOP — cook callback
 
+from __future__ import annotations
 
-def cook(scriptOp):
-    ext    = op('..').ext.OAKManagerExt
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from td import scriptCHOP
+
+
+def cook(scriptOp: scriptCHOP) -> None:
+    ext    = parent.TDOAK.ext.OAKManagerExt
     status = ext.GetStatus()
     imu    = ext.GetImu()
 

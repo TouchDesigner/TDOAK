@@ -1,5 +1,4 @@
-﻿from __future__ import annotations
-from datetime import timedelta
+from __future__ import annotations
 
 # pose_pipeline.py — YOLOv8-nano human pose / skeleton tracking (depthai v3)
 # Load into the Pipeline DAT parameter of the OAK component.
@@ -25,6 +24,11 @@ from datetime import timedelta
 # `PoseEntry` dicts (confidence, box, keypoints, edges) — skeletons are surfaced automatically,
 # no Handler needed. Plain object detectors (no keypoints) decode to bbox-only `DetectionEntry`.
 #
+# NOTE: keypoints are normalized to the model's letterboxed input frame. Streaming
+# `nn.passthrough` as 'rgb' (rather than a separate HD camera output) is what makes the
+# overlay line up 1:1 — a differently-sized, differently-aspect stream would need a
+# letterbox-aware remap.
+#
 # COCO-17 keypoint order:
 #   0 nose       1 lEye       2 rEye       3 lEar       4 rEar
 #   5 lShoulder  6 rShoulder  7 lElbow     8 rElbow     9 lWrist    10 rWrist
@@ -35,7 +39,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import depthai as dai
 
-# Model Zoo slug + variant (288×512 input). Swap to the large variant
+# Model Zoo slug + variant (512×384 input). Swap to the large variant
 # 'luxonis/yolov8-large-pose-estimation:coco-640x352' for accuracy over speed.
 MODEL: str = 'luxonis/yolov8-nano-pose-estimation:coco-512x384'
 
@@ -43,26 +47,19 @@ MODEL: str = 'luxonis/yolov8-nano-pose-estimation:coco-512x384'
 # progress counter before the in-process build runs. List every zoo slug build() resolves.
 MODELS: list[str] = [MODEL]
 
+
 def build(pipeline: dai.Pipeline) -> tuple[dict[str, dai.DataOutputQueue], list[str]]:
     import depthai as dai
     from depthai_nodes.node import ParsingNeuralNetwork
 
     cam = pipeline.create(dai.node.Camera).build()
-    hd = cam.requestOutput((1280, 720), type=dai.ImgFrame.Type.BGR888p, fps=30)
     nn  = pipeline.create(ParsingNeuralNetwork).build(cam, MODEL)
-    
-    # sync camera frame and detection frame
-    sync = pipeline.create(dai.node.Sync)
-    sync.setSyncThreshold(timedelta(milliseconds=10))
-    hd.link(sync.inputs['rgb'])
-    nn.out.link(sync.inputs['pose'])
-    
-    demux = pipeline.create(dai.node.MessageDemux)
-    sync.out.link(demux.input)
 
+    # passthrough and out are emitted in lockstep for the same input frame, so no Sync
+    # node is needed — the keypoints always describe the passthrough frame they rode with.
     queues: dict[str, dai.DataOutputQueue] = {
-        'rgb': demux.outputs['rgb'].createOutputQueue(maxSize=1, blocking=False),
-        'pose': demux.outputs['pose'].createOutputQueue(maxSize=1, blocking=False)
+        'rgb':  nn.passthrough.createOutputQueue(maxSize=1, blocking=False),
+        'pose': nn.out.createOutputQueue(maxSize=1, blocking=False),
     }
 
     return queues, ['rgb', 'pose']

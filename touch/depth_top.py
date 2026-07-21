@@ -2,19 +2,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import numpy as np
-
 if TYPE_CHECKING:
     from td import scriptTOP
 
 
 def cook(scriptOp: scriptTOP) -> None:
-    ext   = op('..').ext.OAKManagerExt
-    frame = ext.GetFrame('depth')
+    ext   = parent.TDOAK.ext.OAKManagerExt
+    frame = ext.GetDepth()
     if frame is None:
         return
 
-    h, w  = frame.shape
-    out   = np.empty((h, w, 1), dtype=np.uint16)
-    out[:, :, 0] = frame
-    scriptOp.copyNumpyArray(out)
+    h, w = frame.shape
+    # The worker delivers a contiguous 2D array, so this reshape is a zero-copy view —
+    # no per-cook allocation.
+    scriptOp.copyNumpyArray(frame.reshape(h, w, 1))

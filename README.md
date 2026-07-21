@@ -113,6 +113,8 @@ Return the last enumerated device list (no network call). Returns an empty list 
 
 Frames are written by the background pump thread and read-locked for safe access from cook callbacks.
 
+> Streams are decoded on demand: the worker skips decoding a stream that has no Streams-block/registry binding and has never been pulled via `GetFrame` (its queue is still drained, so the device never backs up; `rgb` is always decoded — it drives the `Fps` readout). The first `GetFrame(name)` on such a stream registers interest and may return `None` until the next frame arrives.
+
 #### `GetFrame(name: str) -> FrameData | None`
 Return the latest frame for the given stream name, or `None` if no frame has arrived yet.
 
@@ -477,7 +479,7 @@ Resolving a neural model inline (the Model Zoo's online freshness check + downlo
 
 #### Declaring models
 
-A pipeline script declares the models it uses with a module-level `MODELS` list (a bare `MODEL = '...'` is also accepted). This is read on **Start** by exec-ing the script in a throwaway namespace, so keep the heavy work inside `build()` — only the assignment needs to be at module level.
+A pipeline script declares the models it uses with a module-level `MODELS` list (a bare `MODEL = '...'` is also accepted). This is read on **Start** by statically parsing the script (`ast`) — it is never executed, so the scan has no side effects. The declaration must be a literal or reference other module-level literal assignments (`MODELS = [MODEL_A, MODEL_B]` works); a computed value is skipped and `build()` then resolves it inline.
 
 ```python
 MODEL  = 'luxonis/yolov8-nano-pose-estimation:coco-512x384'

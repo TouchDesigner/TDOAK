@@ -33,11 +33,18 @@ from __future__ import annotations
 #
 # VERIFY ON DEVICE (can't be checked without the OAK):
 #   - CROP_PADDING and the rotated-rect back-map (angle sign) in hand_handler.py — tune
-#     until the skeleton sits on the hand. Keep CROP_PADDING here and in the handler equal.
+#     until the skeleton sits on the hand. The value is shared via tdoak.constants, so
+#     tuning it there adjusts both sides at once.
 #   - If the landmarker resolves to multiple output heads, ParsingNeuralNetwork.out emits a
 #     MessageGroup; hand_handler.parse() already digs the Keypoints out of that case.
+#   - Hands near the frame edge: the padded crop rect can extend outside [0, 1]. Depending
+#     on firmware, ImageManip either clamps (shifting the effective crop, which makes the
+#     handler's affine back-map approximate near edges) or errors per detection (the crop
+#     Script now skips that detection and keeps running). Check both behaviors on device.
 
 from typing import TYPE_CHECKING
+
+from tdoak.constants import HAND_CROP_PADDING
 
 if TYPE_CHECKING:
     import depthai as dai
@@ -45,7 +52,7 @@ if TYPE_CHECKING:
 PALM_MODEL: str = 'luxonis/mediapipe-palm-detection:192x192'    # stage 1 (RVC2)
 HAND_MODEL: str = 'luxonis/mediapipe-hand-landmarker:224x224'   # stage 2 (RVC2)
 HAND_INPUT: tuple[int, int] = (224, 224)   # stage-2 model input == FrameCropper output
-CROP_PADDING: float = 0.1                  # normalized padding around each palm rect
+CROP_PADDING: float = HAND_CROP_PADDING    # shared with hand_handler.py via tdoak.constants
 FPS: int = 30                              # camera fps, used by GatherData for matching
 
 # Declared so the host pre-fetches both models on a subprocess before the build runs.
@@ -84,31 +91,44 @@ def build(pipeline: dai.Pipeline) -> tuple[dict[str, dai.DataOutputQueue], list[
     # configs ourselves and set the rect via attribute assignment (the same approach as
     # depthai_nodes' detection_config_generator), which avoids the Size2f constructor.
     # STRETCH maps crop coords linearly onto the rect → the handler back-map stays affine.
+    #
+    # The script re-pairs frame/detections by sequence number: passthrough and out normally
+    # arrive in lockstep, but one dropped message would otherwise shift the pairing by one
+    # PERMANENTLY — every later crop cut from the wrong frame with no error anywhere.
+    # The try/except sits INSIDE the loops so one bad detection (e.g. a degenerate rect)
+    # skips that detection instead of killing the whole 'hands' stream for the session.
     cropW, cropH = HAND_INPUT
     cropScript = pipeline.create(dai.node.Script)
     cropScript.setScript(f"""
-try:
-    while True:
+while True:
+    try:
         frame = node.inputs['frame'].get()
         dets  = node.inputs['dets'].get()
+        while frame.getSequenceNum() < dets.getSequenceNum():
+            frame = node.inputs['frame'].get()
+        while dets.getSequenceNum() < frame.getSequenceNum():
+            dets = node.inputs['dets'].get()
         for det in dets.detections:
-            rr = det.getBoundingBox()
-            rect = RotatedRect()
-            rect.center.x   = rr.center.x
-            rect.center.y   = rr.center.y
-            rect.size.width  = rr.size.width  + 2 * {CROP_PADDING}
-            rect.size.height = rr.size.height + 2 * {CROP_PADDING}
-            rect.angle = rr.angle
-            cfg = ImageManipConfig()
-            cfg.addCropRotatedRect(rect, True)
-            cfg.setOutputSize({cropW}, {cropH}, ImageManipConfig.ResizeMode.STRETCH)
-            cfg.setFrameType(ImgFrame.Type.BGR888p)
-            cfg.setTimestamp(dets.getTimestamp())
-            cfg.setSequenceNum(dets.getSequenceNum())
-            node.outputs['cfg'].send(cfg)
-            node.outputs['img'].send(frame)
-except Exception as e:
-    node.error(str(e))
+            try:
+                rr = det.getBoundingBox()
+                rect = RotatedRect()
+                rect.center.x   = rr.center.x
+                rect.center.y   = rr.center.y
+                rect.size.width  = rr.size.width  + 2 * {CROP_PADDING}
+                rect.size.height = rr.size.height + 2 * {CROP_PADDING}
+                rect.angle = rr.angle
+                cfg = ImageManipConfig()
+                cfg.addCropRotatedRect(rect, True)
+                cfg.setOutputSize({cropW}, {cropH}, ImageManipConfig.ResizeMode.STRETCH)
+                cfg.setFrameType(ImgFrame.Type.BGR888p)
+                cfg.setTimestamp(dets.getTimestamp())
+                cfg.setSequenceNum(dets.getSequenceNum())
+                node.outputs['cfg'].send(cfg)
+                node.outputs['img'].send(frame)
+            except Exception as e:
+                node.warn('crop skipped: ' + str(e))
+    except Exception as e:
+        node.error(str(e))
 """)
     palm.passthrough.link(cropScript.inputs['frame'])
     palm.out.link(cropScript.inputs['dets'])

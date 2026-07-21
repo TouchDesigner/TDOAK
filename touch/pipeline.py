@@ -42,9 +42,11 @@ def build(pipeline: dai.Pipeline) -> tuple[
     demux = pipeline.create(dai.node.MessageDemux)
     sync.out.link(demux.input)
 
+    # maxSize=1, blocking=False — latest-frame semantics. The host drains one message per
+    # poll pass, so the default 16-deep queue would serve up to ~half a second of stale frames.
     queues: dict[str, dai.DataOutputQueue] = {
-        'rgb':   demux.outputs['rgb'].createOutputQueue(),
-        'depth': demux.outputs['depth'].createOutputQueue(),
+        'rgb':   demux.outputs['rgb'].createOutputQueue(maxSize=1, blocking=False),
+        'depth': demux.outputs['depth'].createOutputQueue(maxSize=1, blocking=False),
     }
 
     controls: dict[str, dai.InputQueue] = {
