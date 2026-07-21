@@ -356,6 +356,7 @@ Script TOPs, CHOPs, and DATs support *Modify Outside of Cook*, so the extension 
 | Script **TOP** | pushed — default `copyNumpyArray`, or your `fill` | No |
 | Script **CHOP** | pushed — your `fill` (e.g. `copyNumpyArray((chans, samples) float32)`) | No |
 | **DAT** | pushed — your `fill` (e.g. `clear()` + `appendRows([...])`) | No |
+| Script **POP** | pushed — your `fill` (staging API works outside the cook) | No |
 | Script **SOP** | pulled — your `fill` runs *inside* the cook | Yes — `FillScriptOp(me)` |
 
 For a Script SOP, add a one-line cook callback:

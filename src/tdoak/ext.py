@@ -15,6 +15,9 @@ if TYPE_CHECKING:
 
 
 RECONNECT_DELAY_S    = 10.0   # delay between automatic retry attempts after a pipeline error
+POST_CLOSE_SETTLE_S  = 3.0    # hold the alive-gate after device.close() returns — XLink keeps
+                              # tearing down in native code after the call, and reopening the
+                              # device inside that window can hard-crash the process
 MAX_RETRIES          = 3      # start attempts before giving up until the next Start
 REBUILD_DELAY_FRAMES = 5      # frames between Stop and Start on a Rebuild
 RESTART_POLL_FRAMES  = 15     # re-check cadence while waiting for the previous worker to exit
@@ -196,18 +199,18 @@ class OAKManagerExt:
         self._lastError:     str                  = ''
         self._activeStreams: list[str]            = []
 
-        self._retryCount:      int             = 0
-        self._stopFlag:        threading.Event = threading.Event()  # replaced per run — see startWhenIdle
-        # Worker-liveness Event: set on enqueue, cleared in cameraPump's finally. Fetched from
-        # a process-lifetime registry in the tdoak package so it SURVIVES extension re-inits —
-        # a fresh instance must still see a previous instance's still-running worker, or a
-        # Start right after reinit races the old device teardown (native crash territory).
-        # Falls back to a private Event when the tdoak package isn't importable.
+        self._retryCount: int = 0
+        # Shared worker state ('alive' + current 'stop' Event), fetched from a process-
+        # lifetime registry in the tdoak package so it SURVIVES extension re-inits — a fresh
+        # instance must still see (and be able to stop) a previous instance's still-running
+        # worker, or a Start right after reinit races the old device teardown (native crash
+        # territory). Falls back to private Events when the tdoak package isn't importable.
         try:
             import tdoak
-            self._workerAlive: threading.Event = tdoak.workerAliveEvent(ownerComp.path)
+            self._workerShared: dict[str, threading.Event] = tdoak.workerState(ownerComp.path)
         except Exception:
-            self._workerAlive = threading.Event()
+            self._workerShared = {'alive': threading.Event(), 'stop': threading.Event()}
+        self._workerAlive: threading.Event = self._workerShared['alive']
         self._startRequested:  bool            = False
         self._datVersion:      int | None      = None
         self._latestDevices:   list[DeviceInfo] = []
@@ -288,14 +291,21 @@ class OAKManagerExt:
         if not self._startRequested:
             return  # Stop() cancelled the pending start while we waited
         if self._workerAlive.is_set():
-            self._stopFlag.set()  # make sure the old worker is actually on its way out
+            if not self._workerShared['stop'].is_set():
+                # A pump is already running (or booting) and nobody asked it to stop —
+                # Start is a no-op, NOT a restart (that's Rebuild). Critically, do NOT
+                # touch its stop flag here: a concurrent start chain may have just booted
+                # this pump, and killing it from the deferral path livelocks both chains.
+                self._startRequested = False
+                return
             run('args[0].startWhenIdle()', self,
                 delayFrames=RESTART_POLL_FRAMES, fromOP=self.ownerComp)
             return
         self._startRequested = False
-        # Fresh Event per run: the old worker keeps polling ITS flag (which stays set), so a
-        # new Start can never un-stop a run that is still winding down.
-        self._stopFlag = threading.Event()
+        # Fresh Event per run, published in the shared slot: the old worker keeps polling
+        # ITS flag (which stays set), so a new Start can never un-stop a run that is still
+        # winding down — and Stop() from ANY instance (even after reinit) reaches this run.
+        self._workerShared['stop'] = threading.Event()
         self.setError('')
         self._topScratch.clear()
         config = self.readConfig()
@@ -328,7 +338,7 @@ class OAKManagerExt:
         self.setupModelBlocks(models)
         task = self.ThreadManager.TDTask(
             target=self.cameraPump,
-            args=(config, self._stopFlag),
+            args=(config, self._workerShared['stop']),
             SuccessHook=self.onSuccess,
             ExceptHook=self.onExcept,
             RefreshHook=self.onRefresh,
@@ -342,7 +352,7 @@ class OAKManagerExt:
 
     def Stop(self) -> None:
         self._startRequested = False  # cancel any start still waiting on the old worker
-        self._stopFlag.set()
+        self._workerShared['stop'].set()
 
     def Rebuild(self) -> None:
         self.Stop()
@@ -547,7 +557,10 @@ class OAKManagerExt:
     def GetPose(self)    -> list[PoseEntry] | None: return self.GetFrame('pose')      # type: ignore[return-value]
 
     def GetIntrinsics(self, socket: str = 'CAM_A') -> dict[str, float] | None:
-        """Return {'fx', 'fy', 'cx', 'cy'} for the given socket at native resolution, or None if not available."""
+        """Return {'fx', 'fy', 'cx', 'cy', 'width', 'height'} for the given socket at its
+        native sensor resolution, or None if not available. width/height are the native
+        resolution the coefficients refer to — scale fx/cx by frameW/width (fy/cy by
+        frameH/height) when reprojecting a stream at a different resolution."""
         with self._lock:
             entry = self._intrinsics.get(socket)
             return dict(entry) if entry is not None else None
@@ -806,6 +819,11 @@ class OAKManagerExt:
             self.runPipeline(config, stopFlag, handles)
         finally:
             self.closeDevice(handles['pipeline'], handles['device'])  # type: ignore[arg-type]
+            if handles['device'] is not None or handles['pipeline'] is not None:
+                # device.close() returns before XLink finishes tearing down natively —
+                # keep the alive-gate held so no deferred Start can reopen into that
+                # window (observed to hard-crash TD).
+                time.sleep(POST_CLOSE_SETTLE_S)
             self._workerAlive.clear()
 
     def runPipeline(self, config: PipelineConfig, stopFlag: threading.Event,
@@ -1077,6 +1095,10 @@ class OAKManagerExt:
                         'fy': mat[1][1],
                         'cx': mat[0][2],
                         'cy': mat[1][2],
+                        # native sensor resolution the coefficients refer to — consumers
+                        # scale by streamRes/native when reprojecting other resolutions
+                        'width':  float(getattr(feat, 'width', 0)),
+                        'height': float(getattr(feat, 'height', 0)),
                     }
         with self._lock:
             self._intrinsics = result
@@ -1195,15 +1217,26 @@ class OAKManagerExt:
             self._modelsDone = True
 
     def updateStreamMenus(self, streamNames: list[str]) -> None:
-        """Update the Stream menu on block[0]; TD propagates to all other blocks."""
+        """Update the Stream menu on block[0]; TD propagates to all other blocks.
+
+        Menu pars store their selection by INDEX, so rewriting the menu silently re-maps
+        every block's selection (a block set to a stream of another pipeline would clamp
+        to whatever now sits at that index). Guard against that: the menu is the union of
+        the active streams and every block's current selection, and each block's value is
+        re-assigned by name after the rewrite so no selection ever drifts."""
         if streamNames == self._lastStreamNames:
             return
         self._lastStreamNames = list(streamNames)
         seq = getattr(self.ownerComp.seq, 'Streams', None)
         if seq is None or len(seq) == 0:
             return
-        seq.blockPars.Stream[0].menuNames  = streamNames
-        seq.blockPars.Stream[0].menuLabels = streamNames
+        current = [seq.blockPars.Stream[i].eval() for i in range(len(seq))]
+        menu = list(dict.fromkeys(list(streamNames) + [c for c in current if c]))
+        seq.blockPars.Stream[0].menuNames  = menu
+        seq.blockPars.Stream[0].menuLabels = menu
+        for i, name in enumerate(current):
+            if name:
+                seq.blockPars.Stream[i].val = name
 
     def rebuildBindings(self) -> None:
         """Main thread. Cache the (stream, op) push targets from the Streams sequence and the
@@ -1256,8 +1289,9 @@ class OAKManagerExt:
             return
         self._pushedVersions[verKey] = version
         if filler is not None:
-            # Script TOP/CHOP ('Modify Outside of Cook') and DATs can be written from here.
-            # Script SOPs cannot — geometry must be built in the cook, so a SOP pulls via
+            # Script TOP/CHOP ('Modify Outside of Cook'), DATs, and Script POPs (their
+            # staging API works outside the cook) can all be written from here. Script
+            # SOPs cannot — geometry must be built inside the cook, so a SOP pulls via
             # FillScriptOp(me) from its onCook instead.
             if targetOp.family == 'SOP':
                 return
@@ -1388,13 +1422,17 @@ class OAKManagerExt:
     def onExcept(self, *args: object) -> None:
         # Device already released on the worker (cameraPump's finally), so the retry can't
         # reopen a still-open (PoE) handle. Don't close here — this hook is on the main thread.
-        errorMsg: str = str(args[0]) if args else 'Unknown error'
+        # A cancelled task can hand the hook a bare None — that's not an error message.
+        errorMsg: str = str(args[0]) if args and args[0] is not None else ''
         self.pushStatus(False)
 
-        if self._stopFlag.is_set():
+        if self._workerShared['stop'].is_set():
             # Stop was pressed while the pipeline was failing — honor it, no retry.
-            self.setError(errorMsg)
+            if errorMsg:
+                self.setError(errorMsg)
             return
+        if not errorMsg:
+            errorMsg = 'Unknown error'
 
         self._retryCount += 1
         if self._retryCount >= MAX_RETRIES:
