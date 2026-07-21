@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 # pipeline.py — default OAK pipeline with synced RGB + depth (depthai v3)
 # Load into the Pipeline DAT parameter of the OAK component.
@@ -22,7 +22,7 @@ def build(pipeline: dai.Pipeline) -> tuple[
 
     # ── RGB camera ────────────────────────────────────────────────────────
     cam     = pipeline.create(dai.node.Camera).build()
-    rgb_out = cam.requestOutput((1920, 1080), type=dai.ImgFrame.Type.BGR888p)
+    rgb_out = cam.requestOutput((640, 480), type=dai.ImgFrame.Type.BGR888p)
 
     # ── Stereo depth ──────────────────────────────────────────────────────
     left  = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
