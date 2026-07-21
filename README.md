@@ -2,6 +2,8 @@
 
 TouchDesigner extension for OAK cameras via [depthai](https://docs.luxonis.com/software-v3/) v3.
 
+> Contributing or digging into the internals? Read **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — component map, threading model, data flow, lifecycle state machine, and the crash-safety invariants behind the device teardown path.
+
 Supports USB OAK-D (RGB + stereo depth + IMU) and OAK-D SR PoE (ToF depth + aligned color) with automatic camera-type detection, plus neural pipelines (object detection, human-pose/skeleton tracking). Pipeline scripts are hot-reloadable DATs. Runtime camera controls (exposure, stereo config, ToF config) can be sent from the main thread at any time while the pipeline is running.
 
 Stream data is decoded off the main thread and pushed into Script Operators. Common streams (rgb, depth, amplitude, detections, pose, imu…) are handled out of the box; any other model's output can be decoded and shaped with a per-stream **Handler DAT** — see [Script OP Integration](#script-op-integration).
