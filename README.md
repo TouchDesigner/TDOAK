@@ -20,17 +20,20 @@ Neural models declared by a pipeline are **pre-fetched on a subprocess** before 
 
 ## Quick Start
 
-1. Install TDOAK from git into your virtual environment
+1. Install the package into a Python virtual environment used by TouchDesigner (e.g. one managed by TD's Python Environment Manager). The package is not on a public index, so install straight from GitHub (or from a local clone with pip install <path>):
     ```
     pip install git+https://github.com/TouchDesigner/TDOAK
     ```
     depthai and depthai-nodes are installed as dependencies.
-2. Add a Base COMP and reference `mod.TDOAK.toxPath('TDOAK')` in the `External .tox Path` parameter.
+2. The packaged component (TDOAK.tox) ships inside the package. To load it, create a Base COMP and set its External .tox parameter to the packaged file using an expression:
+    ```
+    mod.TDOAK.toxPath('TDOAK')
+    ```
 3. Click **List Devices** to populate the Device menu.
 4. Select a device (or leave as `-- Select Device --` to use whichever camera connects first).
 5. Click **Start**.
 
-The component's `Connected`, `Fps`, `Activestreams`, and `Lasterror` parameters update every cook. Wire Script TOPs, CHOPs, SOPs, or DATs to the **Streams** sequential block to receive frame data.
+The component's `Connected`, `Fps`, `Activestreams`, and `Lasterror` parameters update every cook. Reference Script TOPs, CHOPs, SOPs, or DATs on the **Streams** sequential block to receive frame data.
 
 The examples folder has a range of pipeline scripts and handler scripts.
 
