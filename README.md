@@ -35,6 +35,9 @@ Neural models declared by a pipeline are **pre-fetched on a subprocess** before 
 
 The component's `Connected`, `Fps`, `Activestreams`, and `Lasterror` parameters update every cook. Reference Script TOPs, CHOPs, SOPs, or DATs on the **Streams** sequential block to receive frame data.
 
+With no pipeline specified, a default pipeline is run with a `rgb` stream. To see the stream, create a Script TOP, toggle on the Script TOP's `Modify Outside of Cook` parameter and empty out the `onCook` callback. Now reference the Script TOP in the TDOAK's Stream parameters.
+This pushing action is not quite optimal in ways that it happens outside TouchDesigner's cook engine with possible sideeffects. So alternatively, in a Script OP, make use of the TDOAK COMP's `FillScriptOp()` function to pull frame data into Script OPs.
+
 The examples folder has a range of pipeline scripts and handler scripts.
 
 ---
