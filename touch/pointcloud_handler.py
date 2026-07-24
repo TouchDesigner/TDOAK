@@ -13,9 +13,11 @@
 STRIDE      = 4      # sample every Nth pixel — 640x480 / 4 ≈ 19k points max per frame
 MAX_DEPTH_M = 4.0    # drop points further than this (stereo gets noisy with distance)
 
-# Stereo depth is aligned to the rectified-RIGHT camera by default → CAM_C intrinsics.
-# Use 'CAM_B' if your pipeline aligns depth to the left camera instead.
-SOCKET = 'CAM_C'
+# Which camera's intrinsics to reproject through. None = auto: stereo depth is aligned
+# to the rectified-RIGHT camera (CAM_C); a ToF sensor carries its own intrinsics on
+# CAM_A and has no CAM_C at all. Set explicitly (e.g. 'CAM_B' for left-aligned stereo)
+# to override the auto order.
+SOCKET = None
 
 
 def fill(scriptOp, depth) -> None:
@@ -29,7 +31,8 @@ def fill(scriptOp, depth) -> None:
     # `oak` — the OAK component — is injected into every Handler DAT's namespace by the
     # extension (fill runs inside the extension, where a bare op('TDOAK') would resolve
     # inside the component itself and return None).
-    k = oak.GetIntrinsics(SOCKET)
+    sockets = (SOCKET,) if SOCKET else ('CAM_C', 'CAM_A', 'CAM_B')
+    k = next((ki for s in sockets if (ki := oak.GetIntrinsics(s)) is not None), None)
     if k is None:
         scriptOp.buildGeometry(stagingData)
         return
@@ -53,5 +56,23 @@ def fill(scriptOp, depth) -> None:
     pts = np.stack([x[valid], yTd[valid], -z[valid]], axis=-1)
 
     stagingData.createPointAttrib(name='P')
-    stagingData.appendPointAttribValues('P', pts.tolist())
+    # copyNumpyArrayToPointAttrib bulk-copies the (N, 3) float32 buffer — far cheaper
+    # than appendPointAttribValues(pts.tolist()), which builds N Python tuples per frame.
+    stagingData.copyNumpyArrayToPointAttrib('P', np.ascontiguousarray(pts))
+
+    # Per-point color from the companion rgb stream: with depth aligned to the RGB
+    # camera (tofShowcase ALIGN_DEPTH_TO_RGB) both share one grid, so the same stride
+    # + validity mask picks each point's pixel. Skipped when rgb isn't streaming yet
+    # or lives on a different grid (alignment off) — the cloud just has no Color then.
+    rgb = oak.GetFrame('rgb')
+    if isinstance(rgb, np.ndarray) and rgb.ndim == 3 and rgb.shape[:2] == depth.shape:
+        col = rgb[::STRIDE, ::STRIDE][valid][:, :3].astype(np.float32) / 255.0
+        rgba = np.empty((col.shape[0], 4), dtype=np.float32)
+        rgba[:, :3] = col
+        rgba[:, 3]  = 1.0
+        # 'Color' is TD's standard POP color attribute (RGBA, like 'P' it comes with
+        # its component count built in).
+        stagingData.createPointAttrib(name='Color')
+        stagingData.copyNumpyArrayToPointAttrib('Color', rgba)
+
     scriptOp.buildGeometry(stagingData)

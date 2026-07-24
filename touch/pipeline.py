@@ -20,6 +20,19 @@ def build(pipeline: dai.Pipeline) -> tuple[
 ]:
     import depthai as dai
 
+    # Guard against the wrong device: this pipeline assumes the stereo OAK-D layout
+    # (color on CAM_A, stereo pair on CAM_B/C). Started on a ToF board — easy to do
+    # with Device on '-- Select Device --' and several OAKs attached — the ToF sensor
+    # can't act as a video camera and the device firmware eventually crashes, taking
+    # every stream down with X_LINK_ERROR. Fail here with a readable message instead.
+    feats = {f.socket: f for f in pipeline.getDefaultDevice().getConnectedCameraFeatures()}
+    camA  = feats.get(dai.CameraBoardSocket.CAM_A)
+    if camA is None or dai.CameraSensorType.COLOR not in camA.supportedTypes:
+        raise RuntimeError(
+            'pipeline.py expects a color camera on CAM_A (stereo OAK-D layout), but this '
+            'device does not have one — it looks like the ToF board. Select the OAK-D in '
+            'the Device menu, or load the ToF showcase pipeline for this device.')
+
     # ── RGB camera ────────────────────────────────────────────────────────
     cam     = pipeline.create(dai.node.Camera).build()
     rgb_out = cam.requestOutput((640, 480), type=dai.ImgFrame.Type.BGR888p)

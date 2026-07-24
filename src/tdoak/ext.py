@@ -1,8 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import os
+os.environ.setdefault('DEPTHAI_INSTALL_SIGNAL_HANDLER', '0')
+os.environ.setdefault('DEPTHAI_CRASHDUMP', '0')
+os.environ.setdefault('DEPTHAI_RECONNECT_TIMEOUT', '0')  # XLink auto-reconnect races Stop teardown and aborts the process
+os.environ.setdefault('DEPTHAI_AUTOCALIBRATION', 'OFF')  # keep the 3.6.1+ auto-injected AutoCalibration node out of pipelines (engages at 640x480 despite documented 1280x800-only support)
 import ast
 import math
-import os
 import threading
 import time
 from contextlib import suppress
@@ -227,6 +231,9 @@ class OAKManagerExt:
         # keyed by the consumer op's path (one fill per op), parsers by stream (one per queue).
         self._componentFillers: dict[str, FillFn]  = {}
         self._componentParsers: dict[str, ParseFn] = {}
+        # Pull-mode handlers (FillScriptOp with an explicit handler DAT), cached per DAT
+        # path as (content hash, parse, fill) — re-exec'd only when the DAT text changes.
+        self._pullHandlers: dict[str, tuple[int, ParseFn | None, FillFn | None]] = {}
         self._handlersVersion:  int | None         = None  # baseline for auto-reload
         self._frameSeq:         int                = 0
 
@@ -511,18 +518,29 @@ class OAKManagerExt:
         streamName = self.bindingForOp(scriptop)
         return self.GetFrame(streamName) if streamName is not None else None
 
-    def FillScriptOp(self, scriptop: OP) -> bool:
+    def FillScriptOp(self, scriptop: OP, stream: str | None = None,
+                     handler: OP | str | None = None) -> bool:
         """Pull entry point: call from a Script Operator's onCook to fill it inside its cook.
-        Runs the op's bound fill(scriptOp, data) — registered via RegisterHandler or a Streams
-        block, both keyed by the op's path — against the latest frame for its stream. Falls back
-        to copyNumpyArray for a Script TOP with no custom fill. Returns True if it filled."""
-        name = self.bindingForOp(scriptop)
+        With no arguments the op's registered binding is used (Streams block / RegisterHandler,
+        keyed by the op's path). Pass `stream` (and optionally `handler`, a Handler DAT or its
+        path) to pull explicitly with zero registration:
+
+            oak.FillScriptOp(scriptOp, stream='depth', handler=op('text_pointcloudHandler'))
+
+        The handler's fill(scriptOp, data) runs against the stream's latest frame; a parse(msg)
+        it defines is installed for the stream's worker-side decode. The DAT is re-exec'd only
+        when its text changes, so calling this every cook is cheap. Falls back to the built-in
+        defaults (numpy image -> Script TOP, float point array -> Script POP) when no fill is
+        available. Returns True if it filled."""
+        name = stream if stream is not None else self.bindingForOp(scriptop)
         if name is None:
             return False
         data = self.GetFrame(name)
         if data is None:
             return False
-        filler = self._fillers.get(scriptop.path)
+        filler = self.pullHandlerFill(handler, name) if handler is not None else None
+        if filler is None:
+            filler = self._fillers.get(scriptop.path)
         if filler is not None:
             try:
                 filler(scriptop, data)
@@ -532,6 +550,13 @@ class OAKManagerExt:
             return True
         if isinstance(scriptop, scriptTOP) and isinstance(data, np.ndarray):
             scriptop.copyNumpyArray(self.prepareTopFrame(data))
+            return True
+        if scriptop.family == 'POP' and self.isPointArray(data):
+            try:
+                self.fillPopPoints(scriptop, data)  # type: ignore[arg-type]
+            except Exception as exc:
+                self.setError(f'fill[{name}]: {exc}')
+                return False
             return True
         return False
 
@@ -879,6 +904,10 @@ class OAKManagerExt:
         fpsTimer:   float = time.monotonic()
         tdThread          = threading.current_thread()
         kinds: dict[str, str] = {}  # stream -> decode kind, classified on the first message
+        # Fps/latency are metered on one designated stream: rgb when present, otherwise
+        # the pipeline's first stream (ToF/custom pipelines carry no rgb at all). Counted
+        # before the wanted-filter so the readout ticks even when nothing is bound yet.
+        clockStream: str | None = 'rgb' if 'rgb' in queues else next(iter(queues), None)
 
         while not stopFlag.is_set() and pipeline.isRunning():
             got = False
@@ -887,6 +916,26 @@ class OAKManagerExt:
                 if msg is None:
                     continue
                 got = True
+
+                if name == clockStream:
+                    frameCount += 1
+                    now     = time.monotonic()
+                    elapsed = now - fpsTimer
+                    if elapsed >= 1.0:
+                        fps = frameCount / elapsed
+                        # Latency against depthai's own clock — msg timestamps share an
+                        # epoch with dai.Clock.now(), not with host time.monotonic().
+                        try:
+                            latencyMs = (dai.Clock.now()
+                                         - msg.getTimestamp()).total_seconds() * 1000.0  # type: ignore[union-attr]
+                        except Exception:
+                            latencyMs = 0.0
+                        self.pushStatus(True, fps=fps, latency=latencyMs,
+                                        streams=streamNames)
+                        frameCount = 0
+                        fpsTimer   = now
+                        tdThread.SetProgressSafe(  # type: ignore[attr-defined]
+                            min(fps / config['fps'], 1.0) if config['fps'] else 0.5)
 
                 # Skip decoding streams nobody consumes (no binding, never pulled via
                 # GetFrame) — the queue is still drained so the device never backs up.
@@ -923,26 +972,6 @@ class OAKManagerExt:
                     continue
                 if data is not None:
                     self.pushFrame(name, data)
-
-                if kind == 'image' and name == 'rgb':
-                    frameCount += 1
-                    now     = time.monotonic()
-                    elapsed = now - fpsTimer
-                    if elapsed >= 1.0:
-                        fps = frameCount / elapsed
-                        # Latency against depthai's own clock — msg timestamps share an
-                        # epoch with dai.Clock.now(), not with host time.monotonic().
-                        try:
-                            latencyMs = (dai.Clock.now()
-                                         - msg.getTimestamp()).total_seconds() * 1000.0  # type: ignore[union-attr]
-                        except Exception:
-                            latencyMs = 0.0
-                        self.pushStatus(True, fps=fps, latency=latencyMs,
-                                        streams=streamNames)
-                        frameCount = 0
-                        fpsTimer   = now
-                        tdThread.SetProgressSafe(  # type: ignore[attr-defined]
-                            min(fps / config['fps'], 1.0) if config['fps'] else 0.5)
 
             if not got:
                 # Sleep only when a full pass found nothing: bursts drain at full speed,
@@ -1255,8 +1284,8 @@ class OAKManagerExt:
         runtime registry — walking the sequence pars every cook is measurable, so pushToScriptops
         iterates this cache instead. Rebuilt immediately by register/reload calls and every
         MAINTENANCE_PERIOD cooks (catching direct par edits). Also derives the wanted-stream set
-        the worker uses to skip decoding streams nobody consumes ('rgb' is always kept — it
-        drives the Fps readout)."""
+        the worker uses to skip decoding streams nobody consumes (the Fps readout is unaffected:
+        the worker meters its clock stream before the wanted-filter)."""
         bindings: list[tuple[str, OP]] = []
         seq = getattr(self.ownerComp.seq, 'Streams', None)
         if seq is not None:
@@ -1270,7 +1299,7 @@ class OAKManagerExt:
                 if (streamName, targetOp) not in bindings:
                     bindings.append((streamName, targetOp))
         self._bindings = bindings
-        wanted = {name for name, _ in bindings} | {'rgb'}
+        wanted = {name for name, _ in bindings}
         with self._lock:
             # Streams with a registered parse count as consumed too — a handler was
             # deliberately attached, so its stream must keep decoding.
@@ -1315,12 +1344,41 @@ class OAKManagerExt:
             except Exception as exc:
                 self.setError(f'fill[{streamName}]: {exc}')
             return
-        # No custom fill: default numpy -> Script TOP only. Non-array defaults
-        # (detections/pose/imu) and Script CHOP/SOPs are pulled, not pushed.
+        # No custom fill: built-in defaults — numpy image -> Script TOP, float point
+        # array -> Script POP (its staging API works outside the cook, no toggle needed).
+        # Non-array defaults (detections/pose/imu) and Script CHOP/SOPs are pulled, not pushed.
         if isinstance(targetOp, scriptTOP) and isinstance(data, np.ndarray):
             if not targetOp.par.modoutsidecook.eval():
                 targetOp.par.modoutsidecook = True
             targetOp.copyNumpyArray(self.prepareTopFrame(data))
+            return
+        if targetOp.family == 'POP' and self.isPointArray(data):
+            try:
+                self.fillPopPoints(targetOp, data)  # type: ignore[arg-type]
+            except Exception as exc:
+                self.setError(f'fill[{streamName}]: {exc}')
+
+    def isPointArray(self, data: FrameData | None) -> bool:
+        """A float (N, 3) or organized (H, W, 3) array — point positions, as produced by
+        the built-in pointcloud decode. Image frames are uint8/uint16, so the float dtype
+        keeps an rgb/depth stream bound to a POP from being misread as geometry."""
+        return (isinstance(data, np.ndarray) and data.ndim in (2, 3)
+                and data.shape[-1] == 3 and np.issubdtype(data.dtype, np.floating))
+
+    def fillPopPoints(self, scriptop: OP, pts: np.ndarray) -> None:
+        """Main thread. Default fill for a Script POP bound to a pointcloud stream:
+        point positions -> P attribute. Organized (H, W, 3) clouds are flattened;
+        invalid points ride along as zeros so the cloud stays pixel-aligned with its
+        companion depth stream. For filtering/color, use a Handler DAT fill instead."""
+        staging = scriptop.createGeometryStagingData()
+        staging.createPointAttrib(name='P')
+        flat = np.ascontiguousarray(pts.reshape(-1, 3), dtype=np.float32)
+        # Bulk buffer copy — appendPointAttribValues(tolist()) walks 307k Python tuples
+        # per frame on a full ToF cloud; the numpy copy is two orders of magnitude cheaper.
+        copyFn = getattr(staging, 'copyNumpyArrayToPointAttrib', None)
+        if copyFn is None or not copyFn('P', flat):
+            staging.appendPointAttribValues('P', flat.tolist())  # pre-POP-API builds
+        scriptop.buildGeometry(staging)
 
     def prepareTopFrame(self, frame: np.ndarray) -> np.ndarray:
         """Main thread. Shape a decoded array for scriptTOP.copyNumpyArray without avoidable
@@ -1462,6 +1520,35 @@ class OAKManagerExt:
         run('args[0].doStart()', self, delayFrames=delayFrames, fromOP=self.ownerComp)
 
     # ── Helpers ───────────────────────────────────────────────────────────
+
+    def pullHandlerFill(self, handler: OP | str, streamName: str) -> FillFn | None:
+        """Main thread. Resolve and exec a pull-mode Handler DAT (FillScriptOp's `handler`
+        argument), cached by content hash so a per-cook call costs one hash of the DAT text.
+        A parse(msg) the handler defines is installed as the stream's worker-side decoder
+        (idempotent, same slot component registrations use, so it survives seq reloads).
+        Returns the handler's fill, or None (missing DAT / exec error / fill-less handler)."""
+        dat = op(handler) if isinstance(handler, str) else handler
+        if dat is None or not dat.valid:
+            self.setError(f'pull[{streamName}]: handler DAT {handler!r} not found')
+            return None
+        version = hash(dat.text)
+        cached = self._pullHandlers.get(dat.path)
+        if cached is not None and cached[0] == version:
+            parseFn, fillFn = cached[1], cached[2]
+        else:
+            loaded = self.execHandler(dat, f'pull:{dat.path}')
+            if loaded is None:
+                # Exec failed (reported via setError). Cache the failure under this hash
+                # so a broken DAT isn't re-exec'd (and re-reported) every single cook.
+                self._pullHandlers[dat.path] = (version, None, None)
+                return None
+            parseFn, fillFn = loaded
+            self._pullHandlers[dat.path] = (version, parseFn, fillFn)
+        if parseFn is not None and self._parsers.get(streamName) is not parseFn:
+            self._componentParsers[streamName] = parseFn
+            with self._lock:  # build-then-swap: the worker reads the dict lock-free
+                self._parsers = {**self._parsers, streamName: parseFn}
+        return fillFn
 
     def execHandler(self, handlerDat: OP, label: str) -> tuple[ParseFn | None, FillFn | None] | None:
         """Main thread. Exec a Handler DAT and return its optional (parse, fill) callables,
