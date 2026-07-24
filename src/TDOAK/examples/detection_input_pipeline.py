@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 # detection_input_pipeline.py — YOLO object detection on HOST frames (depthai v3)
 # Load into the Pipeline DAT parameter of the OAK component.
@@ -11,7 +11,7 @@ from __future__ import annotations
 #
 # Feed it once per frame from an Execute DAT:
 #   def onFrameStart(frame):
-#       op('TDOAK').ext.OAKManagerExt.SendFrame('image_in', op('moviefilein1'))
+#       op('TDOAK').SendFrame('image_in', op('moviefilein1'))
 #
 # Streams:
 #   'rgb'        — the letterboxed frame inference ran on (loops back from the device),
