@@ -3,7 +3,7 @@
 #
 # fill-only: the built-in depth decode (uint16 mm, TD-oriented) stays; this reprojects it
 # through the device calibration (GetIntrinsics). Works with the default RGB+depth
-# pipeline (touch/pipeline.py). Add a Streams block: Stream 'depth', Scriptop → a Script
+# pipeline (pipeline.py). Add a Streams block: Stream 'depth', Scriptop → a Script
 # POP, Handler → this DAT. Script POPs are pushed directly (no cook callback needed) —
 # each new depth frame lands as geometry.
 #

@@ -283,7 +283,7 @@ frames instead of an OAK camera. `source` is any TOP (read via `.numpyArray()`) 
 `(H, W, 3|4)` numpy array; it's coerced to a top-down uint8 BGR `dai.ImgFrame` (float TOPs are
 treated as normalized 0–1). Returns `False` if the queue isn't registered. Main-thread only —
 call it once per cook, e.g. from an Execute/CHOP-Execute callback. See
-`touch/mono_depth_input_pipeline.py`, which runs MiDaS depth on whatever TOP you feed it (an
+`src/TDOAK/examples/mono_depth_input_pipeline.py`, which runs MiDaS depth on whatever TOP you feed it (an
 on-device `ImageManip` resizes/repacks to the model input, so the source can be any size).
 
 ```python
@@ -310,8 +310,8 @@ print(oak.GetControlNames())
 | Built-in RGB + depth | `cam_ctrl` | `dai.CameraControl` | |
 | Built-in RGB + depth | `stereo_cfg` | `dai.StereoDepthConfig` | LR-check, subpixel, etc. |
 | Built-in ToF | `tof_cfg` | `dai.ToFConfig` | ToF base configuration |
-| `touch/pipeline.py` | `cam_ctrl`, `stereo_cfg` | same as above | |
-| `touch/tof_pipeline.py` | `cam_ctrl`, `tof_cfg` | `CameraControl`, `ToFConfig` | `cam_ctrl` targets CAM_B color camera |
+| `src/TDOAK/examples/pipeline.py` | `cam_ctrl`, `stereo_cfg` | same as above | |
+| `src/TDOAK/examples/tof_pipeline.py` | `cam_ctrl`, `tof_cfg` | `CameraControl`, `ToFConfig` | `cam_ctrl` targets CAM_B color camera |
 
 ---
 
@@ -529,15 +529,15 @@ A bare blob without parser metadata won't work with `ParsingNeuralNetwork` (it n
 
 | File | Device | Streams | Controls |
 |---|---|---|---|
-| `touch/pipeline.py` | OAK-D (RGB + stereo depth, synced) | `rgb`, `depth` | `cam_ctrl`, `stereo_cfg` |
-| `touch/tof_pipeline.py` | OAK-D SR PoE (ToF + aligned color) | `depth`, `color`, `amplitude` | `cam_ctrl`, `tof_cfg` |
-| `touch/tof_showcase_pipeline.py` | OAK-D SR PoE (ToF depth + amplitude + organized point cloud) | `depth`, `amplitude`, `pointcloud` | `tof_cfg` |
-| `touch/detection_pipeline.py` | Any RGB OAK (YOLOv6-nano object detection) | `rgb`, `detections` | — |
-| `touch/pose_pipeline.py` | Any RGB OAK (YOLOv8-nano pose / skeleton — needs `depthai-nodes`) | `rgb`, `pose` | — |
-| `touch/mono_depth_pipeline.py` | Any RGB OAK (MiDaS v2.1 monocular depth — needs `depthai-nodes`) | `rgb`, `depth` | — |
-| `touch/mono_depth_input_pipeline.py` | Any OAK (MiDaS depth on **host** frames via `SendFrame` — no camera) | `depth` | `image_in` |
+| `src/TDOAK/examples/pipeline.py` | OAK-D (RGB + stereo depth, synced) | `rgb`, `depth` | `cam_ctrl`, `stereo_cfg` |
+| `src/TDOAK/examples/tof_pipeline.py` | OAK-D SR PoE (ToF + aligned color) | `depth`, `color`, `amplitude` | `cam_ctrl`, `tof_cfg` |
+| `src/TDOAK/examples/tof_showcase_pipeline.py` | OAK-D SR PoE (ToF depth + amplitude + organized point cloud) | `depth`, `amplitude`, `pointcloud` | `tof_cfg` |
+| `src/TDOAK/examples/detection_pipeline.py` | Any RGB OAK (YOLOv6-nano object detection) | `rgb`, `detections` | — |
+| `src/TDOAK/examples/pose_pipeline.py` | Any RGB OAK (YOLOv8-nano pose / skeleton — needs `depthai-nodes`) | `rgb`, `pose` | — |
+| `src/TDOAK/examples/mono_depth_pipeline.py` | Any RGB OAK (MiDaS v2.1 monocular depth — needs `depthai-nodes`) | `rgb`, `depth` | — |
+| `src/TDOAK/examples/mono_depth_input_pipeline.py` | Any OAK (MiDaS depth on **host** frames via `SendFrame` — no camera) | `depth` | `image_in` |
 
-> A standalone harness, `test_pipeline.py`, runs any of these pipeline scripts outside TouchDesigner against a real device (frame shapes, latency, keypoint counts) for quick verification: `python test_pipeline.py touch/pose_pipeline.py --device <ip_or_mxid>`.
+> A standalone harness, `test_pipeline.py`, runs any of these pipeline scripts outside TouchDesigner against a real device (frame shapes, latency, keypoint counts) for quick verification: `python test_pipeline.py src/TDOAK/examples/pose_pipeline.py --device <ip_or_mxid>`.
 
 ---
 

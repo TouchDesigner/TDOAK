@@ -1,10 +1,6 @@
-"""TouchDesigner OAK camera integration"""
-
 from __future__ import annotations
 
 import threading
-
-__version__ = "0.1.0"
 
 # Process-lifetime worker state per OAK component, keyed by component path:
 #   'alive' — Event: set while a camera pump is running (cleared in its finally)

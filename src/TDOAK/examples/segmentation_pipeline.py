@@ -13,7 +13,7 @@ from __future__ import annotations
 #                    it into a uint16 (H, W) class-index map (0 = background, flipped to
 #                    TD orientation), which drops straight into a Script TOP — threshold
 #                    with a Level/Threshold TOP for a person matte. For a POP variant,
-#                    put touch/segmentation_handler.py in the Streams block's Handler and
+#                    put segmentation_handler.py in the Streams block's Handler and
 #                    bind a Script POP: its fill() scatters one point per person pixel
 #                    (strided) — feed particles, instancing, etc.
 

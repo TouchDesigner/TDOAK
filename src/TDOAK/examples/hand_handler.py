@@ -11,10 +11,10 @@
 
 import math
 
-from tdoak.constants import HAND_CROP_PADDING
+from TDOAK.core.constants import HAND_CROP_PADDING
 
 # Must match the padding hand_pipeline.py bakes into its on-device crop Script — the
-# back-map here undoes exactly that padding. Shared via tdoak.constants so it can't drift.
+# back-map here undoes exactly that padding. Shared via TDOAK.core.constants so it can't drift.
 CROP_PADDING = HAND_CROP_PADDING
 
 # Standard MediaPipe 21-keypoint hand connections — used only if the model archive

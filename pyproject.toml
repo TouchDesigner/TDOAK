@@ -4,21 +4,62 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "TDOAK"
-version = "0.1.0"
-description = "TouchDesigner OAK camera integration"
+dynamic = ["version"]
+description = "TouchDesigner OAK (Luxonis depthai v3) camera integration"
 readme = "README.md"
-requires-python = ">= 3.12"
+requires-python = ">=3.11"
+keywords = ["touchdesigner", "oak", "depthai", "luxonis", "camera", "derivative"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+]
 dependencies = [
-    "depthai>=3.6.1",
-    "depthai-nodes",  # ParsingNeuralNetwork + parsers for Model Zoo NNs (pose_pipeline)
-    "numpy",
+  "depthai>=3.8",
+  "depthai-nodes",  # ParsingNeuralNetwork + parsers for Model Zoo NNs (pose_pipeline)
+  "numpy",
+]
+
+[project.urls]
+Repository = "https://github.com/TouchDesigner/TDOAK"
+Issues = "https://github.com/TouchDesigner/TDOAK/issues"
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2.2",
+  "pytest>=8.0.0",
+  "mypy>=1.10",
 ]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "TDOAK.__version__"}
+
+[tool.setuptools.package-data]
+TDOAK = [
+  "*.tox",
+  "td/*",
+  "td/**/*",
+  "examples/*",
+  "examples/**/*",
+]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["*.py[cod]", "__pycache__/*"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["TDOAK*"]
+exclude = [
+  "TDOAK.td", "TDOAK.td.*",
+  "TDOAK.examples", "TDOAK.examples.*",
+  "*.__pycache__", "*.__pycache__.*",
+]
+
+[tool.touchdesigner]
+requiresTouchDesigner = "2025.33070"
 
 [tool.touchdesigner.TDPyEnvManagerContext]
 contextVersion = 2
@@ -27,7 +68,7 @@ active = true
 mode = "Python vEnv"
 envName = ".venv"
 installPath = "."
-pythonVersion = "3.12"
+pythonVersion = "3.11"
 autoSetup = true
 autoSetupReqs = []
 autoSetupSyncReqs = false

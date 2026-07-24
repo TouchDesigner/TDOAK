@@ -11,7 +11,7 @@ from __future__ import annotations
 #   'rgb'     — BGR passthrough: the exact 224×224 frame inference ran on.
 #   'classes' — a depthai-nodes Classifications message. The host's built-in decoder
 #               turns it into ClassificationEntry dicts [{label: str, score: float}, …],
-#               sorted by score. touch/classification_handler.py is a fill-only Handler
+#               sorted by score. classification_handler.py is a fill-only Handler
 #               that writes the top entries into a Table DAT — render the text however
 #               you like from there (the data stays data).
 

@@ -17,7 +17,7 @@ from __future__ import annotations
 #               keypoints  [[x, y], …] — 5 landmarks: right eye, left eye, nose,
 #                          right mouth corner, left mouth corner (normalized 0-1)
 #               edges      [] (YuNet ships no skeleton edges)
-#             No Handler is needed for the data itself; touch/face_handler.py is a
+#             No Handler is needed for the data itself; face_handler.py is a
 #             fill-only Handler that draws boxes + landmarks into a Script POP.
 
 from typing import TYPE_CHECKING

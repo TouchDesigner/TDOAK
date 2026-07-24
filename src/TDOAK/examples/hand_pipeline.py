@@ -24,7 +24,7 @@ from __future__ import annotations
 #             and landmark coords are normalized to THIS frame, so overlays line up 1:1.
 #   'hands' — a depthai_nodes GatheredData message. It is NOT one of the host's built-in
 #             decoders, so bind this stream to a Streams block whose Handler points at
-#             touch/hand_handler.py — its parse() back-maps each hand's crop-local
+#             hand_handler.py — its parse() back-maps each hand's crop-local
 #             keypoints onto the full frame using the palm's rotated rect, and fill()
 #             draws the 21-point skeleton into a Script SOP.
 #
@@ -33,7 +33,7 @@ from __future__ import annotations
 #
 # VERIFY ON DEVICE (can't be checked without the OAK):
 #   - CROP_PADDING and the rotated-rect back-map (angle sign) in hand_handler.py — tune
-#     until the skeleton sits on the hand. The value is shared via tdoak.constants, so
+#     until the skeleton sits on the hand. The value is shared via TDOAK.core.constants, so
 #     tuning it there adjusts both sides at once.
 #   - If the landmarker resolves to multiple output heads, ParsingNeuralNetwork.out emits a
 #     MessageGroup; hand_handler.parse() already digs the Keypoints out of that case.
@@ -44,7 +44,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from tdoak.constants import HAND_CROP_PADDING
+from TDOAK.core.constants import HAND_CROP_PADDING
 
 if TYPE_CHECKING:
     import depthai as dai
@@ -52,7 +52,7 @@ if TYPE_CHECKING:
 PALM_MODEL: str = 'luxonis/mediapipe-palm-detection:192x192'    # stage 1 (RVC2)
 HAND_MODEL: str = 'luxonis/mediapipe-hand-landmarker:224x224'   # stage 2 (RVC2)
 HAND_INPUT: tuple[int, int] = (224, 224)   # stage-2 model input == FrameCropper output
-CROP_PADDING: float = HAND_CROP_PADDING    # shared with hand_handler.py via tdoak.constants
+CROP_PADDING: float = HAND_CROP_PADDING    # shared with hand_handler.py via TDOAK.core.constants
 FPS: int = 30                              # camera fps, used by GatherData for matching
 
 # Declared so the host pre-fetches both models on a subprocess before the build runs.

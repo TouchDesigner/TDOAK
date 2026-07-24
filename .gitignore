@@ -7,15 +7,25 @@ dist/
 build/
 .tox/
 .pytest_cache/
+.mypy_cache/
 *.pyo
 
 # TouchDesigner
-touch/*.tox
-*.tox
 Backup/
+*.tox
+!src/TDOAK/*.tox
+# numbered auto-saves (TDOAK.76.toe) and crash saves
+*.[0-9]*.toe
+CrashAutoSave*.toe
 
 # depthai model cache
 .depthai_cached_models/
+.cache/
+
+# logs & crash dumps
+*.log
+*.stackdump
+*.dmp
 
 # Editors
 .vscode/
@@ -25,3 +35,6 @@ Backup/
 # OS
 .DS_Store
 Thumbs.db
+
+# claude
+.claude/

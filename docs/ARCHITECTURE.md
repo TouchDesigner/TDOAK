@@ -22,14 +22,14 @@ thread, and delivers plain data into bound Script Operators every cook.
 flowchart LR
     subgraph TDPROC["TouchDesigner process"]
         subgraph COMP["OAK component  (Base COMP)"]
-            EXT["OAKManagerExt<br/><i>src/tdoak/ext.py</i><br/>(file-synced Text DAT)"]
+            EXT["OAKManagerExt<br/><i>src/TDOAK/td/OAKManagerExt.py</i><br/>(file-synced Text DAT)"]
             PAREXEC["parexec DAT<br/>routes par pulses → ext"]
             SEQ["<b>Streams</b> sequence: stream → Scriptop → Handler<br/><b>Models</b> sequence: download readout"]
         end
-        PDAT["Pipeline DAT<br/><i>touch/*_pipeline.py</i>"]
-        HDAT["Handler DATs<br/><i>touch/*_handler.py</i>"]
+        PDAT["Pipeline DAT<br/><i>src/TDOAK/examples/*_pipeline.py</i>"]
+        HDAT["Handler DATs<br/><i>src/TDOAK/examples/*_handler.py</i>"]
         OPS["Consumers:<br/>Script TOP / CHOP / DAT / POP / SOP"]
-        PKG["<code>tdoak</code> package<br/>constants + workerState registry"]
+        PKG["<code>TDOAK</code> package<br/>core.constants + core.state workerState registry"]
     end
     VENV[".venv python<br/>model pre-fetch subprocess"]
     ZOO[("Luxonis Model Zoo<br/>.depthai_cached_models/")]
@@ -49,15 +49,17 @@ Key sources:
 
 | Path | Role |
 |---|---|
-| `src/tdoak/ext.py` | The extension. Everything lives here — lifecycle, worker pump, decoders, delivery. File-synced into the component's `OAKManagerExt` Text DAT. |
-| `src/tdoak/__init__.py` | `workerState()` registry — process-lifetime liveness/stop Events per component (survives extension re-inits). |
-| `src/tdoak/constants.py` | Constants shared across the device boundary (e.g. `HAND_CROP_PADDING`, used by both `hand_pipeline.py` and `hand_handler.py`). |
-| `touch/*_pipeline.py` | Pipeline scripts — each defines `build(pipeline)` (see §5). Loaded via the **Pipeline DAT** parameter. |
-| `touch/*_handler.py` | Per-stream Handler DATs — optional `parse` / `fill` (see §6). |
-| `touch/*_top.py`, `touch/data_chop.py` | Example Script-operator cook callbacks (pull style). |
+| `src/TDOAK/td/OAKManagerExt.py` | The extension. Everything lives here — lifecycle, worker pump, decoders, delivery. File-synced into the component's `OAKManagerExt` Text DAT. |
+| `src/TDOAK/td/CameraControlExt.py` | Extension of the OAKCameraControl component — builds `dai.CameraControl` messages from custom parameters and sends them via `SendControl`. |
+| `src/TDOAK/__init__.py` | Package metadata + resource API: `__version__` (single source of truth for releases), `toxPath()`/`toxPaths()` for the packaged `.tox` components, `examplesPath()`/`assetsPath()`. |
+| `src/TDOAK/core/state.py` | `workerState()` registry — process-lifetime liveness/stop Events per component (survives extension re-inits). |
+| `src/TDOAK/core/constants.py` | Constants shared across the device boundary (e.g. `HAND_CROP_PADDING`, used by both `hand_pipeline.py` and `hand_handler.py`). |
+| `src/TDOAK/examples/*_pipeline.py` | Pipeline scripts — each defines `build(pipeline)` (see §5). Loaded via the **Pipeline DAT** parameter. |
+| `src/TDOAK/examples/*_handler.py` | Per-stream Handler DATs — optional `parse` / `fill` (see §6). |
+| `src/TDOAK/examples/*_top.py`, `.../data_chop.py` | Example Script-operator cook callbacks (pull style). |
 
 All DATs in the demo project are file-synced (`syncfile=on`) to these repo files:
-edit the file, TD reloads the DAT. **Editing `ext.py` while a pipeline runs re-initializes
+edit the file, TD reloads the DAT. **Editing `OAKManagerExt.py` while a pipeline runs re-initializes
 the extension mid-flight** — stop the pipeline first (§7 explains why this used to crash,
 and how the shared registry now makes it merely messy instead of fatal).
 
@@ -65,7 +67,7 @@ and how the shared registry now makes it merely messy instead of fatal).
 
 ## 2. Threading model
 
-Three execution contexts. The comment banner in `ext.py`
+Three execution contexts. The comment banner in `OAKManagerExt.py`
 (`# ── Background thread — NO TD object access below this line ──`) marks the split.
 
 | Context | Runs | May touch TD objects? | May call blocking depthai? |
@@ -187,8 +189,8 @@ reproducible cold crash of the TouchDesigner process:**
    `threading.Event`; the pump's handles travel through locals (a `handles` dict),
    never instance attributes. A dying run can only ever close *its own* device, and a
    new Start can never un-stop a run that's still winding down.
-5. **The worker state (`alive` + current `stop` Event) lives in the `tdoak` package**
-   (`tdoak.workerState(compPath)`), not on the extension instance. Extension re-inits
+5. **The worker state (`alive` + current `stop` Event) lives in the `TDOAK` package**
+   (`TDOAK.core.state.workerState(compPath)`), not on the extension instance. Extension re-inits
    (DAT edit, `reinitextensions` pulse) create a fresh instance — it must still *see*
    and be able to *stop* the previous instance's running pump. Without this, a Start
    right after reinit raced the old teardown (crash #1 of this project's history).
@@ -283,7 +285,7 @@ def fill(scriptOp, data):  # MAIN thread. plain data -> the bound operator.
 - Handler errors are caught and reported to `Lasterror` (`parse[stream]: ...`,
   `fill[stream]: ...`); a failing handler never stalls the pump. Type-guard your
   `fill` input anyway — a block bound to the wrong stream should degrade silently
-  (see `touch/*_handler.py` for the pattern).
+  (see `src/TDOAK/examples/*_handler.py` for the pattern).
 
 Registration has two equivalent entry points: the **Streams sequence** (UI) and the
 **component registry** (`RegisterComponent` / `RegisterHandler` / `RegisterScriptop`
@@ -328,7 +330,7 @@ on conflict (`applyHandlers` composes the two).
 
 | You want to… | Do |
 |---|---|
-| Support a new model | Write a pipeline script (`build()` + `MODELS`); if its output message type is already decoded (see `_decoders` in `ext.py`), you're done — otherwise add a Handler `parse`. |
+| Support a new model | Write a pipeline script (`build()` + `MODELS`); if its output message type is already decoded (see `_decoders` in `OAKManagerExt.py`), you're done — otherwise add a Handler `parse`. |
 | Decode a new depthai-nodes message type natively | Add a kind to `classifyMessage` + a `decodeX(msg, name)` method + a `_decoders` entry. Keep decoders pure (no TD access) and return plain data. |
 | Feed a new operator family | Check whether it accepts writes outside its cook. If yes, it's push (nothing to do — bind it with a `fill`); if not, follow the SOP pull pattern (`FillScriptOp`). |
 | Add a component parameter | Add the custom par, read it in `readConfig()` **defensively** (`getattr(par, 'Name', None)`) so existing comps keep working, and ride it to the worker inside `PipelineConfig` — the worker must never read pars. |
