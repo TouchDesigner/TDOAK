@@ -4,7 +4,7 @@ TouchDesigner extension for OAK cameras via [depthai](https://docs.luxonis.com/s
 
 > Contributing or digging into the internals? Read **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — component map, threading model, data flow, lifecycle state machine, and the crash-safety invariants behind the device teardown path.
 
-Supports USB OAK-D (RGB + stereo depth + IMU) and OAK-D SR PoE (ToF depth + aligned color) with automatic camera-type detection, plus neural pipelines (object detection, human-pose/skeleton tracking). Pipeline scripts are hot-reloadable DATs. Runtime camera controls (exposure, stereo config, ToF config) can be sent from the main thread at any time while the pipeline is running.
+Supports USB OAK and PoE OAK including OAK-D SR PoE (ToF depth + aligned color) with automatic camera-type detection, plus neural pipelines (object detection, human-pose/skeleton tracking). Pipeline scripts are reloadable DATs. Runtime camera controls (exposure, stereo config, ToF config) can be sent from the main thread at any time while the pipeline is running.
 
 Stream data is decoded off the main thread and pushed into Script Operators. Common streams (rgb, depth, amplitude, detections, pose, imu…) are handled out of the box; any other model's output can be decoded and shaped with a per-stream **Handler DAT** — see [Script OP Integration](#script-op-integration).
 
@@ -14,22 +14,25 @@ Neural models declared by a pipeline are **pre-fetched on a subprocess** before 
 
 ## Requirements
 
-- TouchDesigner 2025.x (Python 3.11 embedded)
-- depthai 3.6.1 installed in TD's Python environment
-- depthai-nodes (only for the bundled pose pipeline — provides `ParsingNeuralNetwork`)
-- numpy (already bundled with TD)
-- A project `.venv` (`/.venv/Scripts/python.exe`) with `depthai` installed — used by the [model pre-fetch](#model-pre-fetch) subprocess (falls back to TD's Python if absent)
+- TouchDesigner 2025.33xxx
 
 ---
 
 ## Quick Start
 
-1. Drop the OAK COMP into your project.
-2. Click **List Devices** to populate the Device menu.
-3. Select a device (or leave as `-- Select Device --` to use whichever camera connects first).
-4. Click **Start**.
+1. Install TDOAK from git into your virtual environment
+    ```
+    pip install git+https://github.com/TouchDesigner/TDOAK
+    ```
+    depthai and depthai-nodes are installed as dependencies.
+2. Add a Base COMP and reference `mod.TDOAK.toxPath('TDOAK')` in the `External .tox Path` parameter.
+3. Click **List Devices** to populate the Device menu.
+4. Select a device (or leave as `-- Select Device --` to use whichever camera connects first).
+5. Click **Start**.
 
 The component's `Connected`, `Fps`, `Activestreams`, and `Lasterror` parameters update every cook. Wire Script TOPs, CHOPs, SOPs, or DATs to the **Streams** sequential block to receive frame data.
+
+The examples folder has a range of pipeline scripts and handler scripts.
 
 ---
 
@@ -58,12 +61,6 @@ The component's `Connected`, `Fps`, `Activestreams`, and `Lasterror` parameters 
 ---
 
 ## `OAKManagerExt` API Reference
-
-Access the extension from any TD script:
-
-```python
-oak = op('OAK').ext.OAKManagerExt
-```
 
 All methods listed here are safe to call from the **main thread** unless otherwise noted.
 
@@ -222,11 +219,13 @@ Return the intrinsic matrix coefficients for the given camera socket at its nati
 
 ```python
 k = oak.GetIntrinsics('CAM_A')
-# → {'fx': 461.3, 'fy': 461.3, 'cx': 320.0, 'cy': 240.0}
+# → {'fx': 461.3, 'fy': 461.3, 'cx': 320.0, 'cy': 240.0, 'width': 640.0, 'height': 480.0}
 
 k = oak.GetIntrinsics('CAM_B')
-# → {'fx': 855.1, 'fy': 856.2, 'cx': 638.4, 'cy': 403.7}
+# → {'fx': 855.1, 'fy': 856.2, 'cx': 638.4, 'cy': 403.7, 'width': 1280.0, 'height': 800.0}
 ```
+
+`width`/`height` are the native sensor resolution the coefficients refer to. When reprojecting a stream delivered at a different resolution, scale `fx`/`cx` by `frameW / width` and `fy`/`cy` by `frameH / height`.
 
 Socket names match `dai.CameraBoardSocket` member names: `'CAM_A'`, `'CAM_B'`, `'CAM_C'`.
 
@@ -283,12 +282,12 @@ frames instead of an OAK camera. `source` is any TOP (read via `.numpyArray()`) 
 `(H, W, 3|4)` numpy array; it's coerced to a top-down uint8 BGR `dai.ImgFrame` (float TOPs are
 treated as normalized 0–1). Returns `False` if the queue isn't registered. Main-thread only —
 call it once per cook, e.g. from an Execute/CHOP-Execute callback. See
-`src/TDOAK/examples/mono_depth_input_pipeline.py`, which runs MiDaS depth on whatever TOP you feed it (an
-on-device `ImageManip` resizes/repacks to the model input, so the source can be any size).
+`src/TDOAK/examples/detection_input_pipeline.py`, which runs YOLO object detection on whatever TOP you
+feed it (an on-device `ImageManip` letterboxes/repacks to the model input, so the source can be any size).
 
 ```python
 # in an Execute DAT's onFrameStart, or a CHOP Execute callback:
-op('OAK').ext.OAKManagerExt.SendFrame('image_in', op('moviefilein1'))
+op('TDOAK').SendFrame('image_in', op('moviefilein1'))
 ```
 
 The matching pipeline declares the queue with `node.someInput.createInputQueue(...)` and returns
@@ -311,7 +310,8 @@ print(oak.GetControlNames())
 | Built-in RGB + depth | `stereo_cfg` | `dai.StereoDepthConfig` | LR-check, subpixel, etc. |
 | Built-in ToF | `tof_cfg` | `dai.ToFConfig` | ToF base configuration |
 | `src/TDOAK/examples/pipeline.py` | `cam_ctrl`, `stereo_cfg` | same as above | |
-| `src/TDOAK/examples/tof_pipeline.py` | `cam_ctrl`, `tof_cfg` | `CameraControl`, `ToFConfig` | `cam_ctrl` targets CAM_B color camera |
+| `src/TDOAK/examples/tof_showcase_pipeline.py` | `tof_cfg` | `ToFConfig` | |
+| `src/TDOAK/examples/detection_input_pipeline.py` | `image_in` | `ImgFrame` (via `SendFrame`) | host-frame input, no camera |
 
 ---
 
@@ -354,7 +354,7 @@ def fill(scriptOp, data):
 
 #### Push vs pull, by operator family
 
-Script TOPs, CHOPs, and DATs support *Modify Outside of Cook*, so the extension writes into them directly each cook. Script SOPs build geometry inside their cook, so they **pull** instead:
+Script POPs, TOPs, CHOPs, and DATs support *Modify Outside of Cook*, so the extension writes into them directly each cook. Script SOPs build geometry inside their cook, so they have to **pull** instead:
 
 | Operator | How it's filled | Cook callback needed |
 |---|---|---|
@@ -368,7 +368,14 @@ For a Script SOP, add a one-line cook callback:
 
 ```python
 def onCook(scriptOp):
-    op('OAK').ext.OAKManagerExt.FillScriptOp(scriptOp)
+    op('TDOAK').FillScriptOp(scriptOp)
+```
+
+Any Script OP can also **pull without any binding at all** — pass the stream (and optionally a Handler DAT) directly; see the `FillScriptOp` reference below:
+
+```python
+def onCook(scriptOp):
+    op('TDOAK').FillScriptOp(scriptOp, stream='rgb')
 ```
 
 #### Binding streams to operators
@@ -404,7 +411,7 @@ def fill(scriptOp, people):          # people: list[PoseEntry]
             prim = scriptOp.appendPoly(2, closed=False, addPoints=False)
             prim[0].point, prim[1].point = pts[i], pts[j]
 ```
-…with `op('OAK').ext.OAKManagerExt.FillScriptOp(me)` in the SOP's `onCook`.
+…with `op('TDOAK').FillScriptOp(me)` in the SOP's `onCook`.
 
 #### `RegisterScriptop(streamName: str, scriptop: OP) -> None`
 Bind a Script Operator to receive frames for `streamName`. Multiple OPs can be registered for the same stream.
@@ -412,15 +419,38 @@ Bind a Script Operator to receive frames for `streamName`. Multiple OPs can be r
 #### `UnregisterScriptop(streamName: str, scriptop: OP | None = None) -> None`
 Remove a registered binding. Pass `scriptop=None` to remove all bindings for the stream.
 
-#### `FillScriptOp(scriptop: OP) -> bool`
-Pull entry point for Script SOPs (which can't be written outside their cook): call it from the SOP's `onCook` to run the bound stream's `fill(scriptOp, data)` inside the cook. TOPs/CHOPs/DATs are auto-pushed and don't need this. Falls back to `copyNumpyArray` for a Script TOP when no custom `fill` is set. Returns `True` if it filled the operator.
+#### `RegisterComponent(scriptop: OP, streamName: str | None = None, handlerDat: OP | None = None) -> None`
+One-call wiring for a **self-contained stream component**: binds the scriptop to its stream *and* ingests its Handler DAT. `streamName`/`handlerDat` default to `Stream`/`Handler` custom parameters on the scriptop's parent COMP, so a wrapper component wires itself with `RegisterComponent(op('script1'))`. Call on init and whenever the component's Stream/Handler parameter or the handler text changes — not per cook. Re-binds cleanly across a Stream change (the op is cleared from any prior stream first).
+
+#### `UnregisterComponent(scriptop: OP) -> None`
+Tear-down counterpart (call e.g. on component delete): unbinds the op from every stream and drops its `fill`. A stream's `parse` is left in place, since it's shared per physical queue — `Rebuild`/`ReloadHandlers` re-derives it.
+
+#### `RegisterHandler(scriptop: OP, streamName: str, handlerDat: OP | None) -> None` / `UnregisterHandler(scriptop: OP, streamName: str | None = None) -> None`
+Lower-level halves of `RegisterComponent`: ingest (or drop) a Handler DAT for one operator — its `fill` is keyed by the op's path, its `parse` installed per stream (last registration wins; parse is shared across all consumers of that stream). Usually you want `RegisterComponent` instead.
+
+#### `FillScriptOp(scriptop: OP, stream: str | None = None, handler: OP | str | None = None) -> bool`
+Pull entry point: call from a Script Operator's cook callback to fill it *inside* its cook. Three ways to use it, from most to least wiring:
+
+```python
+def onCook(scriptOp):
+    op('TDOAK').FillScriptOp(scriptOp)                    # 1. registered binding
+    op('TDOAK').FillScriptOp(scriptOp, stream='rgb')      # 2. explicit stream
+    op('TDOAK').FillScriptOp(scriptOp, stream='depth',    # 3. explicit stream + handler
+                             handler=op('text_pointcloudHandler'))
+```
+
+1. **No arguments** — the operator's registered binding is used (a **Streams** block or `RegisterScriptop`; the `fill` is keyed by the operator's path). This is the classic Script-SOP form, since SOPs can't be written outside their cook.
+2. **`stream='name'`** — pull that stream explicitly with **zero registration**: no Streams block, no registry entry. The first call marks the stream as wanted, so the worker starts decoding it even if nothing else is bound to it (data then arrives on the next frames). Works for any Script OP family, not just SOPs — useful for ad-hoc consumers that shouldn't appear in the component's UI.
+3. **`handler=`** — a Handler DAT (or its path) to apply on top of an explicit stream: its `fill(scriptOp, data)` runs against the stream's latest frame, and if it defines a `parse(msg)` that parse is installed for the stream's worker-side decode. The DAT is re-exec'd only when its text changes, so calling this every cook is cheap.
+
+When no `fill` is available (neither registered nor passed), built-in fallbacks apply: an ndarray frame into a Script **TOP** (`copyNumpyArray`), a float point array into a Script **POP**. Returns `True` if the operator was filled; `False` means the stream is unknown/unbound, no frame has arrived yet (normal during the first cooks after Start), or no fill/fallback matched. A `fill` that raises reports to `Lasterror` and returns `False` — it never stalls the cook.
 
 #### `GetFrameForScriptop(scriptop: OP) -> FrameData | None`
 Look up the raw frame for the given Script OP (registry + sequential block). A lower-level pull alternative to `FillScriptOp` when you want the data rather than auto-fill.
 
 ```python
 def cook(scriptOp):
-    data = op('OAK').ext.OAKManagerExt.GetFrameForScriptop(me)
+    data = op('TDOAK').GetFrameForScriptop(me)
 ```
 
 ---
@@ -527,17 +557,31 @@ A bare blob without parser metadata won't work with `ParsingNeuralNetwork` (it n
 
 ### Bundled pipeline scripts
 
+All paths relative to `src/TDOAK/examples/` (resolve at runtime with `mod.TDOAK.examplesPath()`).
+
 | File | Device | Streams | Controls |
 |---|---|---|---|
-| `src/TDOAK/examples/pipeline.py` | OAK-D (RGB + stereo depth, synced) | `rgb`, `depth` | `cam_ctrl`, `stereo_cfg` |
-| `src/TDOAK/examples/tof_pipeline.py` | OAK-D SR PoE (ToF + aligned color) | `depth`, `color`, `amplitude` | `cam_ctrl`, `tof_cfg` |
-| `src/TDOAK/examples/tof_showcase_pipeline.py` | OAK-D SR PoE (ToF depth + amplitude + organized point cloud) | `depth`, `amplitude`, `pointcloud` | `tof_cfg` |
-| `src/TDOAK/examples/detection_pipeline.py` | Any RGB OAK (YOLOv6-nano object detection) | `rgb`, `detections` | — |
-| `src/TDOAK/examples/pose_pipeline.py` | Any RGB OAK (YOLOv8-nano pose / skeleton — needs `depthai-nodes`) | `rgb`, `pose` | — |
-| `src/TDOAK/examples/mono_depth_pipeline.py` | Any RGB OAK (MiDaS v2.1 monocular depth — needs `depthai-nodes`) | `rgb`, `depth` | — |
-| `src/TDOAK/examples/mono_depth_input_pipeline.py` | Any OAK (MiDaS depth on **host** frames via `SendFrame` — no camera) | `depth` | `image_in` |
+| `pipeline.py` | OAK-D (RGB + stereo depth, synced) | `rgb`, `depth` | `cam_ctrl`, `stereo_cfg` |
+| `tof_showcase_pipeline.py` | OAK-D SR PoE (ToF depth + amplitude; `rgb` when a color socket exists; organized point cloud opt-in via `STREAM_POINTCLOUD`) | `rgb`, `depth`, `amplitude` (+ `pointcloud`) | `tof_cfg` |
+| `yolo_pipeline.py` | Any RGB OAK (YOLOv6-nano object detection) | `rgb`, `detections` | — |
+| `detection_input_pipeline.py` | Any OAK (YOLO detection on **host** frames via `SendFrame` — no camera) | `rgb`, `detections` | `image_in` |
+| `pose_pipeline.py` | Any RGB OAK (YOLOv8-nano pose / skeleton — needs `depthai-nodes`) | `rgb`, `pose` | — |
+| `mono_depth_pipeline.py` | Any RGB OAK (MiDaS v2.1 monocular depth — needs `depthai-nodes`) | `rgb`, `depth` | — |
+| `face_pipeline.py` | Any RGB OAK (YuNet face detection + 5 landmarks — needs `depthai-nodes`) | `rgb`, `faces` | — |
+| `hand_pipeline.py` | Any RGB OAK (MediaPipe two-stage hand tracking — needs `depthai-nodes`; pair with `hand_handler.py`) | `rgb`, `hands` | — |
+| `classification_pipeline.py` | Any RGB OAK (EfficientNet-Lite0 classification — needs `depthai-nodes`) | `rgb`, `classes` | — |
+| `segmentation_pipeline.py` | Any RGB OAK (DeepLabV3+ person segmentation — needs `depthai-nodes`) | `rgb`, `segmentation` | — |
 
-> A standalone harness, `test_pipeline.py`, runs any of these pipeline scripts outside TouchDesigner against a real device (frame shapes, latency, keypoint counts) for quick verification: `python test_pipeline.py src/TDOAK/examples/pose_pipeline.py --device <ip_or_mxid>`.
+### Bundled Handler DATs
+
+| File | Stream | What it does |
+|---|---|---|
+| `pointcloud_handler.py` | `depth` | fill-only — reprojects the depth map through the device calibration (`GetIntrinsics`) into a metric point cloud in a Script **POP**. Pairs with `pipeline.py`. |
+| `face_handler.py` | `faces` | fill-only — draws the detected face landmark points into a Script **POP**. |
+| `hand_handler.py` | `hands` | `parse` + `fill` — decodes the GatheredData message, back-maps each hand's crop-local keypoints onto the full frame, and draws 21-point skeletons into a Script **SOP**. Required by `hand_pipeline.py`. |
+| `classification_handler.py` | `classes` | fill-only — writes the top results into a Table **DAT** (`label \| score` rows, sorted). |
+| `segmentation_handler.py` | `segmentation` | fill-only — shapes the class mask into silhouette points in a Script **POP**. |
+| `pose_handler.py`, `skeleton_handler.py` | — | blank `parse`/`fill` templates to start a custom Handler from. |
 
 ---
 
@@ -551,3 +595,18 @@ The camera pump runs in a **background thread** managed by TD's `ThreadManager`.
 - **`SendControl`**: calls `InputQueue.send()` directly from the main thread. depthai input queues are designed for cross-thread use; no intermediate queue is needed.
 
 The background thread **must not access any TD objects** (`op()`, `me`, `run()`, parameters, etc.) — this is why a Handler's `parse` (worker thread) must stay pure-Python/numpy while `fill` (main thread) does the operator I/O. Handler DAT text is read on the main thread (it's TD access) and the resulting `parse`/`fill` callables are stored on the extension; the worker reads `self._parsers` fresh per message rather than capturing it, so `ReloadHandlers()` can swap the whole dict on the main thread (an atomic reference reassignment) and the running worker picks it up with no restart and no lock. All TD access happens exclusively in the Thread Manager hooks.
+
+---
+
+## Releasing
+
+The package version lives in one place: `__version__` in `src/TDOAK/__init__.py` (`pyproject.toml` reads it dynamically). To publish a release:
+
+1. Bump `__version__` (e.g. `"0.1.2"`), commit, push.
+2. Tag and push the tag:
+   ```
+   git tag v0.1.2
+   git push origin v0.1.2
+   ```
+
+The `Release` GitHub workflow triggers on `v*` tags, verifies the tag matches `__version__` (mismatch fails the run), builds sdist + wheel, and publishes them to a GitHub Release with generated notes. CI (`ci.yml`) additionally builds and smoke-tests the wheel on every push.

@@ -4,6 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "TDOAK"
+license-files = ["LICENSE"]
 dynamic = ["version"]
 description = "TouchDesigner OAK (Luxonis depthai v3) camera integration"
 readme = "README.md"
@@ -44,6 +45,8 @@ TDOAK = [
   "td/**/*",
   "examples/*",
   "examples/**/*",
+  "assets/*",
+  "assets/**/*",
 ]
 
 [tool.setuptools.exclude-package-data]

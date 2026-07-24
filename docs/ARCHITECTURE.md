@@ -311,6 +311,14 @@ on conflict (`applyHandlers` composes the two).
 
 ## 8. Known sharp edges
 
+- **Crash-safety env guards.** The first lines of `OAKManagerExt.py` set (via
+  `setdefault`, before the first depthai import): `DEPTHAI_INSTALL_SIGNAL_HANDLER=0`
+  (depthai's bundled handler otherwise replaces TD's crash reporting — TD then vanishes
+  with no dump), `DEPTHAI_CRASHDUMP=0` (skips the post-close device-crash-dump check that
+  reconnects during teardown), and `DEPTHAI_RECONNECT_TIMEOUT=0` (XLink auto-reconnect
+  races Stop teardown and aborts the process). They are process-global and only take
+  effect for values not already set in the TD process — changing them needs a TD restart.
+  Background: `docs/luxonis-crash-report.md`.
 - **Menu pars store selections by index.** `updateStreamMenus` therefore builds the
   Stream menu as the union of active streams and every block's current selection, and
   re-assigns each block *by name* after a rewrite. If you touch that code, remember: a
