@@ -4,7 +4,7 @@ import os
 os.environ.setdefault('DEPTHAI_INSTALL_SIGNAL_HANDLER', '0')
 os.environ.setdefault('DEPTHAI_CRASHDUMP', '0')
 os.environ.setdefault('DEPTHAI_RECONNECT_TIMEOUT', '0')  # XLink auto-reconnect races Stop teardown and aborts the process
-os.environ.setdefault('DEPTHAI_AUTOCALIBRATION', 'OFF')  # keep the 3.6.1+ auto-injected AutoCalibration node out of pipelines (engages at 640x480 despite documented 1280x800-only support)
+#os.environ.setdefault('DEPTHAI_AUTOCALIBRATION', 'OFF')  # keep the 3.6.1+ auto-injected AutoCalibration node out of pipelines (engages at 640x480 despite documented 1280x800-only support)
 import ast
 import math
 import threading
