@@ -14,7 +14,7 @@ __all__ = [
     'toxPaths',
 ]
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 __td_requires_touchdesigner__ = "2025.33070"
 __td_package_type__ = ""
 __td_collection__ = {
