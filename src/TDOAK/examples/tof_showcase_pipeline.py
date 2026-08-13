@@ -106,11 +106,7 @@ def build(pipeline: dai.Pipeline) -> tuple[
     rgbOut = None
     if rgbSocket is not None:
         cam    = pipeline.create(dai.node.Camera).build(rgbSocket)
-        # NV12, not BGR888p: BGR conversion costs an on-device ImageManip stage, and
-        # with the ToF decode already occupying CMX the RVC2 runs out of pool memory
-        # ('ImageManip out of memory'). NV12 comes straight off the ISP; the host's
-        # getCvFrame() converts to BGR for free on decode.
-        rgbOut = cam.requestOutput(RGB_RESOLUTION, type=dai.ImgFrame.Type.NV12)
+        rgbOut = cam.requestOutput(RGB_RESOLUTION)
         queues['rgb'] = rgbOut.createOutputQueue(maxSize=1, blocking=False)
         streams.append('rgb')
 

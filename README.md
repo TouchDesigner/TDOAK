@@ -507,7 +507,7 @@ import depthai as dai
 
 def build(pipeline):
     cam = pipeline.create(dai.node.Camera).build()
-    out = cam.requestOutput((1280, 720), type=dai.ImgFrame.Type.BGR888p)
+    out = cam.requestOutput((1280, 720))
 
     queues   = {'rgb': out.createOutputQueue()}
     controls = {'cam_ctrl': cam.inputControl.createInputQueue(maxSize=1, blocking=False)}

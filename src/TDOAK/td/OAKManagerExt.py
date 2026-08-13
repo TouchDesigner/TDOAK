@@ -1187,7 +1187,7 @@ class OAKManagerExt:
             controls['tof_cfg'] = tofNode.tofBaseInputConfig.createInputQueue(maxSize=1, blocking=False)  # type: ignore[attr-defined]
         else:
             cam    = pipeline.create(dai.node.Camera).build()
-            rgbOut = cam.requestOutput(DEFAULT_RGB_RESOLUTION, type=dai.ImgFrame.Type.NV12)
+            rgbOut = cam.requestOutput(DEFAULT_RGB_RESOLUTION)
             queues['rgb'] = rgbOut.createOutputQueue()
             streams.append('rgb')
             controls['cam_ctrl'] = cam.inputControl.createInputQueue(maxSize=1, blocking=False)  # type: ignore[attr-defined]
