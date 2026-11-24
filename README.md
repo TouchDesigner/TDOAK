@@ -134,7 +134,7 @@ Read **Status**, **Last Error** and **Last Warning** first — every failure pat
 | Last Warning: *download[model]: …* | The model pre-fetch subprocess failed; the reason is in the message. The model is then fetched in-process (works, but the UI can hitch). On macOS a stand-alone Python cannot load depthai from TouchDesigner's environment at all, so this warning is expected there. | Usually nothing. Offline: download once while online; the cache is `.depthai_cached_models/` in the project folder. |
 | Last Warning: *depthai host-node workaround active* | Informational. In TouchDesigner 2025.33230 with depthai 3.12.2, depthai drops Python host nodes (everything from depthai-nodes); TDOAK keeps them alive. | Nothing. |
 | Last Warning: *no built-in decoder for … messages* | The stream carries a message type TDOAK doesn't decode. | Attach a Handler DAT with a `parse(msg)`. |
-| Colours of a stream look swapped (after upgrading) | Since 0.1.4 every colour stream is delivered as RGB, not only the one named `rgb`. | Remove channel swaps you added in your own handlers. |
+| Colours of a stream look swapped (after upgrading) | Since 0.2.0 every colour stream is delivered as RGB, not only the one named `rgb`. | Remove channel swaps you added in your own handlers. |
 
 The full Python traceback of the last failed run: `op('TDOAK').GetLastTraceback()`. The Thread Manager's log (Palette → TDResources → threadManager → logger) has the worker-side messages.
 
@@ -746,11 +746,11 @@ The package version lives in one place: `__version__` in `src/TDOAK/__init__.py`
      ```
    A `.tox` doesn't record its save build anywhere TouchDesigner can read back, so this field is a stamp, not a live value. **Version** and **Depthai Version** fill themselves at runtime from the installed packages.
    Careful when adding parameters to the **Device** page: a parameter appended after the `Models` sequence corrupts the sequence. Remove the sequence, add and sort the parameters, then re-create it (`appendSequence('Models')`, parameters `Model` and `Progress`, `seq.blockSize = 2`).
-4. Bump `__version__` (e.g. `"0.1.4"`), commit, push.
+4. Bump `__version__` (e.g. `"0.2.1"`), commit, push.
 5. Tag and push the tag:
    ```
-   git tag v0.1.4
-   git push origin v0.1.4
+   git tag v0.2.1
+   git push origin v0.2.1
    ```
 
 The `Release` GitHub workflow triggers on `v*` tags, verifies the tag matches `__version__` (mismatch fails the run), runs the tests, builds sdist + wheel, and publishes them to a GitHub Release with generated notes. CI (`ci.yml`) runs the tests on Linux, macOS and Windows and smoke-tests the built wheel on every push.
