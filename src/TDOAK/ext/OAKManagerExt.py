@@ -1,12 +1,13 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 os.environ.setdefault('DEPTHAI_INSTALL_SIGNAL_HANDLER', '0')
 os.environ.setdefault('DEPTHAI_CRASHDUMP', '0')
 os.environ.setdefault('DEPTHAI_RECONNECT_TIMEOUT', '0')  # XLink auto-reconnect races Stop teardown and aborts the process
-#os.environ.setdefault('DEPTHAI_AUTOCALIBRATION', 'OFF')  # keep the 3.6.1+ auto-injected AutoCalibration node out of pipelines (engages at 640x480 despite documented 1280x800-only support)
+# The auto-injected AutoCalibration node is switched off per pipeline in runPipeline
+# (pipeline.setAutoCalibrationMode) — DEPTHAI_AUTOCALIBRATION=OFF is only honored when set
+# before depthai is first loaded, so it can't be relied on from here.
 
-import ast
 import math
 import threading
 import time
@@ -14,16 +15,32 @@ from contextlib import suppress
 from typing import TYPE_CHECKING, Callable, Protocol, TypedDict
 
 import numpy as np
+# TouchDesigner's own module — this file is a regular package module (not a DAT), so the
+# TD globals a DAT gets for free are imported explicitly. Only importable inside TD.
+from td import op, project, run, scriptTOP
+
+from TDOAK.core import compat as coreCompat
+from TDOAK.core import decode as coreDecode
+from TDOAK.core import env as coreEnv
+from TDOAK.core import device as coreDevice
+from TDOAK.core import models as coreModels
+from TDOAK.core import state as coreState
+from TDOAK.core.errors import (ErrorLog, PipelineError, Tail, formatTaskError, hint,
+                               summarizeCrashDump, withHint)
+from TDOAK.core.retry import RetryPolicy
+from TDOAK.core.watchdog import FrameWatchdog
 
 if TYPE_CHECKING:
-    from td import COMP, OP, Par, TOP, scriptTOP
+    from td import COMP, OP, Par, TOP
 
 
-RECONNECT_DELAY_S    = 10.0   # delay between automatic retry attempts after a pipeline error
 POST_CLOSE_SETTLE_S  = 3.0    # hold the alive-gate after device.close() returns — XLink keeps
                               # tearing down in native code after the call, and reopening the
                               # device inside that window can hard-crash the process
-MAX_RETRIES          = 3      # start attempts before giving up until the next Start
+MAX_RETRIES          = 3      # start attempts in a row before giving up (Reconnect = limited)
+HEALTHY_RUN_S        = 30.0   # a run that streamed this long resets the retry counter
+RETRY_BACKOFF_S      = (5.0, 10.0, 20.0, 40.0, 60.0)  # delay before retry 1, 2, ... (last repeats)
+FPS_IDLE_RESET_S     = 1.5    # clock stream silent this long -> Fps readout drops to 0
 REBUILD_DELAY_FRAMES = 5      # frames between Stop and Start on a Rebuild
 RESTART_POLL_FRAMES  = 15     # re-check cadence while waiting for the previous worker to exit
 MAINTENANCE_PERIOD   = 30     # cooks between autoreload checks + binding-cache rebuilds
@@ -43,7 +60,7 @@ class DeviceInfo(TypedDict):
     protocol: str
 
 
-class DetectionEntry(TypedDict):
+class DetectionEntry(TypedDict):   # spatial detections add x, y, z (millimetres)
     label:      int
     confidence: float
     xmin:       float
@@ -73,30 +90,37 @@ class ClassificationEntry(TypedDict):
 
 
 class ImuData(TypedDict):
-    accel: list[float]
-    gyro:  list[float]
+    accel:   list[float]        # latest reading [x, y, z], m/s^2
+    gyro:    list[float]        # latest reading [x, y, z], rad/s
+    samples: list[list[float]]  # every packet of the batch: [ax, ay, az, gx, gy, gz, t]
 
 
 class StatusInfo(TypedDict):
     connected:  bool
     fps:        float
     latency_ms: float
-    error:      str
+    error:      str               # why the pipeline is not running ('' = no error)
+    warning:    str               # a problem the pipeline survives ('' = none)
     streams:    list[str]
+    status:     str               # lifecycle text, same as the Status par
+    stream_age: dict[str, float]  # seconds since each stream's last message
 
 
 class PipelineConfig(TypedDict):
     device:         str
-    fps:            int
+    firstFrameTimeout: float    # seconds from start to the first frame before the run fails (0 = off)
+    stallTimeout:   float       # seconds without any frame before the run fails (0 = off)
+    crashDump:      bool        # read a pending device crash dump on connect
     logLevel:       str         # depthai verbosity: trace/debug/info/warn/error/critical
+    autoCalibration: str        # depthai AutoCalibration mode: off/onstart/continuous
     enableDepth:    bool
     enableImu:      bool
     pipelineScript: str | None
     pipelinePath:   str         # DAT path of the pipeline script, for traceback attribution
     models:         list[str]   # everything the script declares (module-level MODELS): slugs + local paths
     localModels:    list[str]   # subset of models that resolve to a local file → load directly, no zoo prefetch
+    projectFolder:  str         # project.folder — handed to the pipeline script as PROJECT_FOLDER
     cacheDir:       str         # DEPTHAI_ZOO_CACHE_PATH shared by the prefetch subprocess + in-proc build
-    venvPython:     str         # interpreter to run the prefetch subprocess with
 
 
 # Per-stream handler hooks (defined in a Streams-block Handler DAT):
@@ -171,22 +195,74 @@ def _nodeMessageTypes() -> dict[str, type]:
     return _NODE_TYPES
 
 
-def _rotatedRectBox(rr: object) -> tuple[list[float], float]:
-    """Axis-aligned [xmin, ymin, xmax, ymax] outer bounds (normalized) + rotation in degrees
-    for a depthai RotatedRect. Prefers getPoints(); falls back to center/size trigonometry."""
-    angle = float(getattr(rr, 'angle', 0.0))
-    getPoints = getattr(rr, 'getPoints', None)
-    if callable(getPoints):
-        pts = getPoints()
-        xs  = [float(p.x) for p in pts]
-        ys  = [float(p.y) for p in pts]
-        return [min(xs), min(ys), max(xs), max(ys)], angle
-    cx, cy = float(rr.center.x), float(rr.center.y)        # type: ignore[attr-defined]
-    hw, hh = float(rr.size.width) / 2.0, float(rr.size.height) / 2.0  # type: ignore[attr-defined]
-    ca, sa = math.cos(math.radians(angle)), math.sin(math.radians(angle))
-    xs = [cx + dx * ca - dy * sa for dx, dy in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh))]
-    ys = [cy + dx * sa + dy * ca for dx, dy in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh))]
-    return [min(xs), min(ys), max(xs), max(ys)], angle
+# Python host nodes (depthai-nodes' ParsingNeuralNetwork and its parsers, any
+# dai.node.ThreadedHostNode / HostNode subclass) created during the current run, kept alive
+# for the life of that run — see installHostNodeKeepAlive. Per worker thread.
+_hostNodes = threading.local()
+
+
+def installHostNodeKeepAlive(dai: object) -> bool:
+    """WORKER thread. Work around Python host nodes losing their identity.
+
+    Seen with depthai 3.12.2 inside TouchDesigner 2025.33230 (Python 3.11.15), not with the
+    same depthai under a stock Python: pipeline.create(<Python subclass of ThreadedHostNode>)
+    hands back a bare depthai.node.ThreadedHostNode. The Python instance is dropped before
+    create() returns, so depthai re-wraps the C++ node as its base type — every
+    depthai-nodes pipeline then dies with "'ThreadedHostNode' object has no attribute
+    'build'".
+
+    The breakage is PROBED first (one throw-away host-only pipeline); only when it is
+    present is Pipeline.create wrapped, and the wrapper does one thing: hold a reference to
+    each Python host node while create() runs and for the rest of the run, so depthai
+    finds the live instance. Returns True when the workaround is active."""
+    create = dai.Pipeline.create  # type: ignore[attr-defined]
+    if getattr(create, '_tdoakKeepAlive', False):
+        return True
+    base = dai.node.ThreadedHostNode  # type: ignore[attr-defined]
+
+    class _Probe(base):  # type: ignore[misc,valid-type]
+        def __init__(self) -> None:
+            super().__init__()
+
+        def run(self) -> None:
+            pass
+
+    probe = dai.Pipeline(False)  # type: ignore[attr-defined]
+    healthy = isinstance(probe.create(_Probe), _Probe)
+    del probe
+    if healthy:
+        return False
+
+    def keepAliveCreate(self: object, cls: object, *args: object, **kwargs: object) -> object:
+        isPythonHostNode = (isinstance(cls, type) and issubclass(cls, base)
+                            and not cls.__module__.startswith('depthai.')
+                            and cls.__module__ != 'depthai')
+        if not isPythonHostNode:
+            return create(self, cls, *args, **kwargs)
+        made: list[object] = []
+        ownInit = cls.__dict__.get('__init__')
+        inherited = cls.__init__
+
+        def capturingInit(obj: object, *a: object, **k: object) -> None:
+            made.append(obj)
+            inherited(obj, *a, **k)
+
+        cls.__init__ = capturingInit  # type: ignore[misc]
+        try:
+            node = create(self, cls, *args, **kwargs)
+        finally:
+            if ownInit is None:
+                del cls.__init__
+            else:
+                cls.__init__ = ownInit  # type: ignore[misc]
+        keep = getattr(_hostNodes, 'nodes', None)
+        if keep is not None:
+            keep.extend(made)
+        return node if isinstance(node, cls) or not made else made[0]
+
+    keepAliveCreate._tdoakKeepAlive = True  # type: ignore[attr-defined]
+    dai.Pipeline.create = keepAliveCreate   # type: ignore[attr-defined]
+    return True
 
 
 class OAKManagerExt:
@@ -202,21 +278,44 @@ class OAKManagerExt:
         self._connected:     bool                 = False
         self._fps:           float                = 0.0
         self._latencyMs:     float                = 0.0
-        self._lastError:     str                  = ''
+        self._errors:        ErrorLog             = ErrorLog()  # guarded by self._lock
+        self._lastTraceback: str                  = ''
         self._activeStreams: list[str]            = []
+        self._status:        str                  = 'Idle'
+        self._deviceInfo:    str                  = ''
+        self._streamAges:    dict[str, float]     = {}
+        self._streamedFor:   float                = 0.0  # seconds the last run delivered frames
 
-        self._retryCount: int = 0
-        # Shared worker state ('alive' + current 'stop' Event), fetched from a process-
-        # lifetime registry in the TDOAK package so it SURVIVES extension re-inits — a fresh
-        # instance must still see (and be able to stop) a previous instance's still-running
-        # worker, or a Start right after reinit races the old device teardown (native crash
-        # territory). Falls back to private Events when the TDOAK package isn't importable.
-        try:
-            from TDOAK.core.state import workerState
-            self._workerShared: dict[str, threading.Event] = workerState(ownerComp.path)
-        except Exception:
-            self._workerShared = {'alive': threading.Event(), 'stop': threading.Event()}
-        self._workerAlive: threading.Event = self._workerShared['alive']
+        self._retry: RetryPolicy = RetryPolicy(
+            'limited', MAX_RETRIES, HEALTHY_RUN_S, RETRY_BACKOFF_S)
+        # Bumped by every Start/Stop. A delayed start (retry, Rebuild) carries the token it
+        # was scheduled with and stands down when it no longer matches — so Stop during a
+        # retry wait really cancels the retry.
+        self._startToken: int = 0
+        # Shared worker state ('alive', current 'stop' Event, pump thread, owner), fetched
+        # from a process-lifetime registry in the TDOAK package so it SURVIVES extension
+        # re-inits — a fresh instance must still see (and be able to stop) a previous
+        # instance's still-running worker, or a Start right after reinit races the old
+        # device teardown (native crash territory).
+        self._workerShared: dict[str, object] = coreState.workerState(ownerComp.path)
+        self._workerAlive: threading.Event = self._workerShared['alive']  # type: ignore[assignment]
+        # A pump from a previous instance is still running (extension re-init mid-run, e.g.
+        # the extension DAT was edited). Its frames and hooks belong to the old instance,
+        # so the component would be half-connected: stop that run and start a fresh one
+        # under this instance — a re-init behaves like Rebuild.
+        # The restart intent is kept in the shared state ('resume'): TouchDesigner can
+        # initialize the extension more than once for one DAT reload, and only the last
+        # instance survives to do the restart.
+        inherited: bool = coreState.isWorkerAlive(self._workerShared)
+        if inherited and not self.stopEvent().is_set():
+            coreState.requestResume(self._workerShared)
+        coreState.claim(self._workerShared, self)
+        if inherited:
+            self.stopEvent().set()
+        resume: bool = coreState.resumeRequested(self._workerShared)
+        # True from Start until Stop: the user wants a pipeline running. Drives the
+        # restart after a re-init and the Autoreload restart after a failed build.
+        self._wantRunning: bool = resume
         self._startRequested:  bool            = False
         self._datVersion:      int | None      = None
         self._latestDevices:   list[DeviceInfo] = []
@@ -280,14 +379,132 @@ class OAKManagerExt:
         self.ownerComp.par.Fps = 0
         self.ownerComp.par.Activestreams = ''
         self.ownerComp.par.Lasterror = ''
-        self.ownerComp.par.Device.menuNames = ['None']
-        self.ownerComp.par.Device.menuLabels = ['-- Select Device --']
+        self.ownerComp.par.Lastwarning = ''
+        self.ownerComp.par.Deviceinfo = ''
+        self.ownerComp.par.Status = 'Idle'
+        self.setDeviceMenu([])
+        self.updateAbout()
+        if resume:
+            self.setStatus('Extension reloaded - restarting the pipeline...')
+            self._startRequested = True
+            run('args[0].delayedStart(args[1])', self, self._startToken,
+                delayFrames=1, fromOP=self.ownerComp)
+        run('args[0].maintenanceTick()', self,
+            delayFrames=MAINTENANCE_PERIOD, fromOP=self.ownerComp)
+
+    def onDestroyTD(self) -> None:
+        """TouchDesigner is destroying this instance: re-init, component deleted, project
+        closing or TD quitting. Never leave a pump running behind a dead extension — it
+        would keep the device open with nobody able to stop it. If the user wanted the
+        pipeline running, a restart is requested for whichever instance initializes next
+        (a re-init); the request expires on its own when none does."""
+        if not self.isOwner():
+            return  # a newer instance already took over and dealt with the run
+        if self._wantRunning:
+            coreState.requestResume(self._workerShared)
+        self._startRequested = False
+        self._startToken += 1
+        self.stopEvent().set()
+
+    def maintenanceTick(self) -> None:
+        """Main thread, every MAINTENANCE_PERIOD frames for the life of this instance —
+        independent of the pump, whose RefreshHook only runs while a run is alive. Keeps
+        Autoreload working exactly when it is needed most: after a build error there is no
+        pump, and fixing the Pipeline DAT must still restart the pipeline."""
+        if not self.isOwner() or not self.ownerComp.valid:
+            return  # superseded or destroyed — let the chain end
+        par = self.ownerComp.par
+        if (self._wantRunning and not self._startRequested and par.Autoreload.eval()
+                and not coreState.isWorkerAlive(self._workerShared)):
+            dat = par.Pipelinedat.eval()
+            if dat is not None and self.datContentHash(dat) != self._datVersion:
+                self._retry = self.newRetryPolicy()
+                self._startToken += 1  # cancel a retry that is still waiting
+                self.setError('')      # the script was edited: its old error is history
+                self.setStatus('Pipeline DAT changed - restarting...')
+                self.doStart()
+        run('args[0].maintenanceTick()', self,
+            delayFrames=MAINTENANCE_PERIOD, fromOP=self.ownerComp)
+
+    def stopEvent(self) -> threading.Event:
+        """The CURRENT run's stop flag (a fresh Event is published per run)."""
+        return self._workerShared['stop']  # type: ignore[return-value]
+
+    def isOwner(self) -> bool:
+        """False once a newer extension instance has taken over the component. Delayed
+        callbacks and ThreadManager hooks of a superseded instance must stand down."""
+        return coreState.isOwner(self._workerShared, self)
+
+    def setDeviceMenu(self, devices: list[DeviceInfo]) -> None:
+        """Main thread. Rebuild the Device menu WITHOUT losing the selection. Menu pars
+        store their selection by index, so a plain rewrite silently re-points Device at
+        whatever lands on the old index (or at 'first available' when the menu shrinks).
+        The current selection is kept in the menu even when the device isn't visible right
+        now, and re-assigned by name afterwards."""
+        par     = self.ownerComp.par.Device
+        current = par.eval()
+        names:  list[str] = ['None'] + [d['mxid'] for d in devices]
+        labels: list[str] = ['-- Select Device --'] + [
+            f"{d['name'] or d['mxid']}  [{d['protocol']}]" for d in devices]
+        if current and current not in names:
+            names.append(current)
+            labels.append(f'{current}  [not found]')
+        par.menuNames  = names
+        par.menuLabels = labels
+        par.val = current if current else 'None'
+
+    def updateAbout(self) -> None:
+        """Main thread. Fill the About page's read-only version fields. Version comes from
+        the installed TDOAK package (the .tox ships inside it, so they match). The depthai
+        version is read from sys.modules only — never imported here, so init stays cheap;
+        it fills in once enumeration or a Start has loaded depthai."""
+        import sys
+        import TDOAK
+        par = self.ownerComp.par
+        par.Version = str(TDOAK.__version__)
+        dai = sys.modules.get('depthai')
+        if dai is not None:
+            par.Depthaiversion = coreCompat.depthaiStatus(
+                str(getattr(dai, '__version__', 'unknown')))
 
     # ── Public API (main thread only) ────────────────────────────────────
 
     def Start(self) -> None:
-        self._retryCount = 0
+        """Start the pipeline. A no-op (reported in Status) while one is already running —
+        use Rebuild to restart."""
+        self._retry = self.newRetryPolicy()
+        self._startToken += 1
+        self._wantRunning = True
+        self.setError('')
+        self.clearWarning()
         self.doStart()
+
+    def newRetryPolicy(self) -> RetryPolicy:
+        """A fresh failure counter with the current Reconnect setting — every deliberate
+        (re)start begins one: Start, Rebuild, and the Autoreload restart."""
+        return RetryPolicy(self.ownerComp.par.Reconnect.eval(),
+                           MAX_RETRIES, HEALTHY_RUN_S, RETRY_BACKOFF_S)
+
+    def StartFromUi(self) -> None:
+        """The Start pulse: look for devices first, so 'nothing plugged in' is reported
+        instead of failing somewhere inside depthai. While a pump is alive the enumeration
+        is skipped (the device is in use; Start reports 'already running' or waits)."""
+        if coreState.isWorkerAlive(self._workerShared):
+            self.Start()
+            return
+        self.setStatus('Looking for devices...')
+        self.ListDevices(callback=self.onDevicesForStart)
+
+    def onDevicesForStart(self, devices: list[DeviceInfo]) -> None:
+        # A specific Device selection is always tried, found or not (a PoE camera on
+        # another subnet is invisible to discovery but reachable) — depthai then reports
+        # it. Only 'first available' with nothing visible is a certain dead end.
+        if not devices and not self.selectedDevice():
+            self.setError('No OAK device found - check the cable, power, or (PoE) that the '
+                          'camera is on this subnet')
+            self.setStatus('Idle')
+            return
+        self.Start()
 
     def doStart(self) -> None:
         """Request a start. Defers (re-polling) while a previous worker is still winding
@@ -296,34 +513,44 @@ class OAKManagerExt:
         self._startRequested = True
         self.startWhenIdle()
 
+    def delayedStart(self, token: int) -> None:
+        """A start scheduled earlier with run() (retry, Rebuild, re-init restart). Stands
+        down when a Start/Stop happened in between or a newer instance owns the component."""
+        if token != self._startToken or not self.isOwner():
+            return
+        self.doStart()
+
     def startWhenIdle(self) -> None:
-        if not self._startRequested:
+        if not self._startRequested or not self.isOwner():
             return  # Stop() cancelled the pending start while we waited
-        if self._workerAlive.is_set():
-            if not self._workerShared['stop'].is_set():
+        if coreState.isWorkerAlive(self._workerShared):
+            if not self.stopEvent().is_set():
                 # A pump is already running (or booting) and nobody asked it to stop —
                 # Start is a no-op, NOT a restart (that's Rebuild). Critically, do NOT
                 # touch its stop flag here: a concurrent start chain may have just booted
                 # this pump, and killing it from the deferral path livelocks both chains.
                 self._startRequested = False
+                self.setStatus('Already running - use Rebuild to restart')
                 return
+            self.setStatus('Waiting for the previous run to close...')
             run('args[0].startWhenIdle()', self,
                 delayFrames=RESTART_POLL_FRAMES, fromOP=self.ownerComp)
             return
         self._startRequested = False
+        coreState.cancelResume(self._workerShared)
         # Fresh Event per run, published in the shared slot: the old worker keeps polling
         # ITS flag (which stays set), so a new Start can never un-stop a run that is still
         # winding down — and Stop() from ANY instance (even after reinit) reaches this run.
         self._workerShared['stop'] = threading.Event()
-        self.setError('')
+        self.setStatus('Starting...')
         self._topScratch.clear()
         config = self.readConfig()
+        if os.environ.get('DEPTHAI_ZOO_CACHE_PATH') != config['cacheDir']:
+            os.environ['DEPTHAI_ZOO_CACHE_PATH'] = config['cacheDir']
         # Seed the Autoreload baseline to the DAT we're starting with. Otherwise _datVersion
         # stays at its None sentinel and the first maintenance tick reads a real hash != None
         # as an edit, firing a spurious Rebuild() a moment after every Start.
-        datRef = self.ownerComp.par.Pipelinedat.eval()
-        dat    = op(datRef) if datRef else None
-        self._datVersion = self.datContentHash(dat)
+        self._datVersion = self.datContentHash(self.ownerComp.par.Pipelinedat.eval())
         # Load per-stream Handler DATs on the main thread (the worker can't touch ops): parsers
         # are read by the worker, fillers by the main-thread cook side. Both live on the instance
         # so ReloadHandlers() can hot-swap them without restarting the pipeline. Seed the
@@ -335,37 +562,57 @@ class OAKManagerExt:
         # worker subprocess so the download never holds TD's GIL. Mirror them into the readonly
         # Models sequence here (main thread, the only place TD ops are touchable) so each model
         # gets a live Progress readout that onRefresh updates while the subprocess runs.
-        models = self.readPipelineModels(config)
+        models = config['models']
         local  = self.localModels(models)
-        config['models']      = models
         config['localModels'] = list(local)
         # Local NNArchive/blob models need no download — seed them at 1.0 so the sequence shows
         # them ready immediately; zoo slugs start at 0.0 and fill as the prefetch streams.
         with self._lock:
             self._modelProgress = {m: (1.0 if m in local else 0.0) for m in models}
+            self._streamedFor   = 0.0
+            self._streamAges    = {}
+            self._deviceInfo    = ''
+            self._lastTraceback = ''
         self._modelsDone = False
         self.setupModelBlocks(models)
         task = self.ThreadManager.TDTask(
             target=self.cameraPump,
-            args=(config, self._workerShared['stop']),
+            args=(config, self.stopEvent()),
             SuccessHook=self.onSuccess,
             ExceptHook=self.onExcept,
             RefreshHook=self.onRefresh,
         )
-        self._workerAlive.set()  # cleared by the worker in cameraPump's finally
+        # The gate: set here, cleared by the worker in cameraPump's finally. The thread is
+        # recorded next to it so isWorkerAlive() can tell a live pump from a stale flag.
+        self._workerShared['thread'] = None
+        self._workerAlive.set()
         try:
-            self.ThreadManager.EnqueueTask(task, standalone=True)
+            self._workerShared['thread'] = self.ThreadManager.EnqueueTask(task, standalone=True)
         except Exception:
-            self._workerAlive.clear()
+            # EnqueueTask can raise AFTER it started the thread (it writes pars last), so
+            # only open the gate again when no pump thread actually exists.
+            if self._workerShared['thread'] is None and not any(
+                    t.name == 'cameraPump' and t.is_alive() for t in threading.enumerate()):
+                self._workerAlive.clear()
             raise
 
     def Stop(self) -> None:
         self._startRequested = False  # cancel any start still waiting on the old worker
-        self._workerShared['stop'].set()
+        self._startToken += 1         # ... and any retry / Rebuild start scheduled with run()
+        self._wantRunning = False
+        coreState.cancelResume(self._workerShared)
+        self.stopEvent().set()
+        self.setStatus('Stopping...' if coreState.isWorkerAlive(self._workerShared) else 'Stopped')
 
     def Rebuild(self) -> None:
+        """Stop and start again — the way to apply changed settings to a running pipeline."""
         self.Stop()
-        run('args[0].Start()', self, delayFrames=REBUILD_DELAY_FRAMES, fromOP=self.ownerComp)
+        self._retry = self.newRetryPolicy()
+        self._wantRunning = True
+        self.setError('')
+        self.clearWarning()
+        run('args[0].delayedStart(args[1])', self, self._startToken,
+            delayFrames=REBUILD_DELAY_FRAMES, fromOP=self.ownerComp)
 
     def ReloadHandlers(self) -> None:
         """Re-load the Streams blocks' Handler DATs and hot-swap parse/fill into the running
@@ -373,6 +620,9 @@ class OAKManagerExt:
         its Scriptop, or its Handler DAT. Adding a brand-new *physical* stream still needs a
         Rebuild (that's a pipeline build() change). Safe to call when stopped — it just primes
         state for the next Start."""
+        # A successful reload proves the handler problems are fixed — drop their warnings
+        # first; a handler that still fails reports again right away.
+        self.clearWarning(('handler[', 'fill[', 'parse[', 'pull['))
         self.applyHandlers(*self.loadStreamHandlers())
         self._handlersVersion = self.handlersContentHash()
         self.rebuildBindings()
@@ -388,6 +638,15 @@ class OAKManagerExt:
             self._parsers = {**seqParsers, **self._componentParsers}
 
     def ListDevices(self, callback: Callable[[list[DeviceInfo]], None] | None = None) -> None:
+        # Never scan while a device is booting or tearing down (pump alive, not yet/no
+        # longer streaming): XLink discovery inside that window races the same native
+        # teardown the alive-gate protects. The last known list is served instead.
+        with self._lock:
+            connected = self._connected
+        if coreState.isWorkerAlive(self._workerShared) and not connected:
+            if callback:
+                callback(self.GetDevices())
+            return
         task = self.ThreadManager.TDTask(
             target=self.enumerateDevices,
             # Closure, not instance state: overlapping ListDevices calls each keep their own
@@ -400,11 +659,42 @@ class OAKManagerExt:
     def GetDevices(self) -> list[DeviceInfo]:
         with self._lock: return list(self._latestDevices)
 
-    def OnPulseStart(self, par: Par) -> None:          self.Start()
+    def CheckForUpdate(self) -> None:
+        """Main thread. Check GitHub for a newer TDOAK release and report it in the About
+        page's Update Status. Check-only — never installs. The HTTP request runs on a
+        ThreadManager worker so a slow network can't stall TD's main thread."""
+        import TDOAK
+        from TDOAK.core import update
+        statusPar = self.ownerComp.par.Updatestatus
+        current = str(TDOAK.__version__)
+        devCheckout = update.isDevCheckout(TDOAK.__file__)
+        result: dict[str, str] = {}  # per-call closure state — overlapping checks can't clash
+
+        def work() -> None:  # WORKER thread — no TD access
+            try:
+                result['status'] = update.describe(current, update.fetchLatest(), devCheckout)
+            except Exception as exc:
+                result['status'] = 'Check failed: ' + update.reason(exc)
+
+        def done() -> None:  # main thread
+            statusPar.val = result.get('status', 'Check failed: no result')
+
+        statusPar.val = 'Checking for updates...'
+        self.ThreadManager.EnqueueTask(self.ThreadManager.TDTask(
+            target=work, SuccessHook=done, ExceptHook=lambda *a: done()))
+
+    # Pulse routing: the component's parexec DAT dispatches every custom pulse to
+    # OnPulse<Parname>, so a new pulse par only needs a method here — no parexec edit.
+    def OnPulseStart(self, par: Par) -> None:          self.StartFromUi()
     def OnPulseStop(self, par: Par) -> None:           self.Stop()
     def OnPulseRebuild(self, par: Par) -> None:        self.Rebuild()
-    def OnPulseListdevices(self, par: Par) -> None:    self.ListDevices()
+    def OnPulseRefresh(self, par: Par) -> None:        self.ListDevices()
     def OnPulseReloadhandlers(self, par: Par) -> None: self.ReloadHandlers()
+    def OnPulseCheckupdate(self, par: Par) -> None:    self.CheckForUpdate()
+
+    def OnPulseHelp(self, par: Par) -> None:
+        import webbrowser
+        webbrowser.open('https://github.com/TouchDesigner/TDOAK')
 
     def RegisterScriptop(self, streamName: str, scriptop: OP) -> None:
         """Bind a Script TOP or Script CHOP to receive data for streamName.
@@ -505,12 +795,11 @@ class OAKManagerExt:
         for streamName, ops in self._scriptopRegistry.items():
             if scriptop in ops:
                 return streamName
-        seq = getattr(self.ownerComp.seq, 'Streams', None)
-        if seq is not None:
-            for i in range(len(seq)):
-                regOp = seq.blockPars.Scriptop[i].eval()
-                if regOp is not None and regOp.path == scriptop.path:
-                    return seq.blockPars.Stream[i].eval()
+        seq = self.ownerComp.seq.Streams
+        for i in range(len(seq)):
+            regOp = seq.blockPars.Scriptop[i].eval()
+            if regOp is not None and regOp.path == scriptop.path:
+                return seq.blockPars.Stream[i].eval()
         return None
 
     def GetFrameForScriptop(self, scriptop: OP) -> FrameData | None:
@@ -546,7 +835,7 @@ class OAKManagerExt:
             try:
                 filler(scriptop, data)
             except Exception as exc:
-                self.setError(f'fill[{name}]: {exc}')
+                self.setWarning(f'fill[{name}]: {exc}')
                 return False
             return True
         if isinstance(scriptop, scriptTOP) and isinstance(data, np.ndarray):
@@ -556,7 +845,7 @@ class OAKManagerExt:
             try:
                 self.fillPopPoints(scriptop, data)  # type: ignore[arg-type]
             except Exception as exc:
-                self.setError(f'fill[{name}]: {exc}')
+                self.setWarning(f'fill[{name}]: {exc}')
                 return False
             return True
         return False
@@ -602,7 +891,8 @@ class OAKManagerExt:
         try:
             q.send(message)
             return True
-        except Exception:
+        except Exception as exc:
+            self.setWarning(f'control[{name}]: {exc}')
             return False
 
     def SendFrame(self, name: str, source: TOP | np.ndarray,
@@ -628,7 +918,8 @@ class OAKManagerExt:
         try:
             q.send(frame)
             return True
-        except Exception:
+        except Exception as exc:
+            self.setWarning(f'control[{name}]: {exc}')
             return False
 
     def toBgrUint8(self, source: TOP | np.ndarray) -> np.ndarray | None:
@@ -662,8 +953,11 @@ class OAKManagerExt:
                 connected=  self._connected,
                 fps=        self._fps,
                 latency_ms= self._latencyMs,
-                error=      self._lastError,
+                error=      self._errors.text('error'),
+                warning=    self._errors.text('warning'),
                 streams=    list(self._activeStreams),
+                status=     self._status,
+                stream_age= dict(self._streamAges),
             )
 
     # ── Internal push methods (background thread → shared state) ─────────
@@ -683,14 +977,62 @@ class OAKManagerExt:
             self._modelProgress[model] = min(max(frac, 0.0), 1.0)
 
     def setError(self, msg: str) -> None:
-        """Record an error — the single choke point every error path funnels through.
-        Thread-safe: a worker just records state for onRefresh to mirror into Lasterror;
-        on the main thread the par is also written immediately, because onRefresh only
-        runs while a pump task is alive (errors while stopped must still surface)."""
+        """Record why the pipeline is NOT running (failed start, lost device, stall) — shown
+        in Lasterror with the time it happened. Kept until the next Start/Rebuild."""
+        self.report('error', msg)
+
+    def setWarning(self, msg: str) -> None:
+        """Record a problem the pipeline survives (a handler raised, a stream went quiet, a
+        USB2 link, a failed model download) — shown in Lastwarning. Latest one wins."""
+        self.report('warning', msg)
+
+    def clearWarning(self, prefixes: tuple[str, ...] = ()) -> None:
+        """Clear Lastwarning — with prefixes, only if the current warning starts with one."""
         with self._lock:
-            self._lastError = msg
+            self._errors.clear('warning', prefixes)
         if threading.current_thread() is self._mainThread:
-            self.ownerComp.par.Lasterror = msg
+            self.mirrorErrors()
+
+    def report(self, kind: str, msg: str) -> None:
+        """The single choke point every error/warning funnels through. Thread-safe: a
+        worker just records state for onRefresh to mirror; on the main thread the pars are
+        also written immediately, because onRefresh only runs while a pump task is alive
+        (errors while stopped must still surface)."""
+        with self._lock:
+            self._errors.set(kind, msg)
+        if threading.current_thread() is self._mainThread:
+            self.mirrorErrors()
+
+    def mirrorErrors(self) -> None:
+        """Main thread. Write both channels to their pars and print every message that has
+        not been printed before (once per distinct text — a per-frame handler error
+        neither floods the textport nor hides behind the parameter)."""
+        with self._lock:
+            error   = self._errors.display('error')
+            warning = self._errors.display('warning')
+            pending = self._errors.takePending()
+        par = self.ownerComp.par
+        if par.Lasterror.eval() != error:
+            par.Lasterror = error
+        if par.Lastwarning.eval() != warning:
+            par.Lastwarning = warning
+        for kind, message in pending:
+            print(f'TDOAK {kind} ({self.ownerComp.path}): {message}')
+
+    def GetLastTraceback(self) -> str:
+        """Full Python traceback of the last failed run ('' if none) — the detail behind
+        the one-line Lasterror."""
+        with self._lock:
+            return self._lastTraceback
+
+    def setStatus(self, text: str) -> None:
+        """Record the lifecycle state shown in the Status par ('Starting...', 'Streaming',
+        'Retrying in 10 s', ...). Thread-safe, same split as setError: a worker records it
+        for onRefresh to mirror; the main thread also writes the par immediately."""
+        with self._lock:
+            self._status = text
+        if threading.current_thread() is self._mainThread:
+            self.ownerComp.par.Status = text
 
     def pushStatus(self, connected: bool, fps: float = 0.0, latency: float = 0.0,
                    streams: list[str] | None = None) -> None:
@@ -720,19 +1062,17 @@ class OAKManagerExt:
 
     def onEnumerateSuccess(self, callback: Callable[[list[DeviceInfo]], None] | None = None) -> None:
         devices = self.GetDevices()
-        names:  list[str] = [d['mxid']                                      for d in devices]
-        labels: list[str] = [f"{d['name'] or d['mxid']}  [{d['protocol']}]" for d in devices]
-        names.insert(0, 'None')
-        labels.insert(0, '-- Select Device --')
-        self.ownerComp.par.Device.menuNames  = names
-        self.ownerComp.par.Device.menuLabels = labels
+        self.setDeviceMenu(devices)
+        self.updateAbout()  # enumeration has loaded depthai by now
         if callback:
             callback(devices)
 
     def onEnumerateExcept(self, *args: object) -> None:
-        errorMsg: str = str(args[0]) if args else 'Unknown error'
+        errorMsg: str = (formatTaskError(args[0]) if args else '') or 'Unknown error'
         self.pushDevices([])
         self.setError(f'devices[enumerate]: {errorMsg}')
+        if self._status == 'Looking for devices...':
+            self.setStatus('Idle')
 
     def downloadModels(self, config: PipelineConfig, platform: str,
                        stopFlag: threading.Event) -> bool:
@@ -740,7 +1080,6 @@ class OAKManagerExt:
         download holds its OWN GIL, not TD's. Returns True if every model exited cleanly
         (so the caller can trust the cache and skip the online check)."""
         import subprocess
-        import sys
 
         # Local models are loaded straight from disk in the script's build() — nothing to fetch,
         # so just mark them complete. Only zoo slugs go through getModelFromZoo.
@@ -751,7 +1090,16 @@ class OAKManagerExt:
         if not zooModels:
             return True
 
-        python = config['venvPython'] if os.path.exists(config['venvPython']) else sys.executable
+        # The interpreter of the environment depthai was loaded from (else <project>/.venv).
+        # Never TouchDesigner's own sys.executable: that can be the application binary.
+        import depthai as dai
+        python = coreEnv.findPython(getattr(dai, '__file__', None), config['projectFolder'])
+        if python is None:
+            self.setWarning('download: no Python interpreter with depthai found for the model '
+                            'pre-fetch (looked in the environment depthai was loaded from and '
+                            'in <project>/.venv) - models are fetched in-process instead, '
+                            'which can freeze the UI during the download')
+            return False
         env = dict(os.environ)
         env['DEPTHAI_ZOO_CACHE_PATH'] = config['cacheDir']
         env['DEPTHAI_ZOO_INTERNET_CHECK'] = '1'  # the subprocess is allowed to hit the network
@@ -786,8 +1134,9 @@ class OAKManagerExt:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, env=env, creationflags=flags,
         )
+        tail = Tail()  # last output lines of the child — the reason when it fails
         drain = threading.Thread(target=self.drainDownloadProgress,
-                                 args=(proc.stdout, model), daemon=True)
+                                 args=(proc.stdout, model, tail), daemon=True)
         drain.start()
         try:
             while True:
@@ -809,10 +1158,13 @@ class OAKManagerExt:
         if proc.returncode == 0:
             self.setModelProgress(model, 1.0)  # cached archives emit no progress; force full
             return True
-        self.setError(f'download[{model}]: exit {proc.returncode}')
+        reason = tail.text() or f'exit {proc.returncode}'
+        advice = hint(tail.full())
+        self.setWarning(f'download[{model}]: {reason} (interpreter: {python})'
+                        + (f' - {advice}' if advice else ''))
         return False
 
-    def drainDownloadProgress(self, stream: object, model: str) -> None:
+    def drainDownloadProgress(self, stream: object, model: str, tail: Tail) -> None:
         """Prefetch helper thread. Parse depthai's JSON progress lines
         ({"download_now", "download_total", "log_type": "download"}, emitted ~every 100 ms)
         into a 0..1 fraction. Best-effort: exits on EOF or when fetchModel closes the pipe."""
@@ -821,7 +1173,8 @@ class OAKManagerExt:
             for line in stream:  # type: ignore[attr-defined]
                 line = line.strip()
                 if not line.startswith('{'):
-                    continue  # depthai's own [info] logs aren't JSON — ignore them
+                    tail.add(line)  # depthai logs / a Python traceback — kept for the error
+                    continue
                 try:
                     msg = json.loads(line)
                 except ValueError:
@@ -842,21 +1195,53 @@ class OAKManagerExt:
         # Handles travel through this dict (per-run locals, not instance state) so a dying
         # run can only ever close its own device — see startWhenIdle.
         handles: dict[str, object] = {'pipeline': None, 'device': None}
+        # Everything the teardown needs is bound to LOCALS up front, and the gate is
+        # cleared in the innermost finally: nothing that goes wrong during teardown — not
+        # even this module's globals vanishing under a DAT reload — may leave 'alive' set,
+        # because a stuck gate turns every later Start into a no-op.
+        alive  = self._workerAlive
+        sleep  = time.sleep
+        settle = POST_CLOSE_SETTLE_S
+        close  = self.closeDevice
+        failure: str = ''
         try:
             self.runPipeline(config, stopFlag, handles)
+        except Exception as exc:
+            # Keep the MESSAGE, drop the traceback: ThreadManager stores the exception it
+            # is handed, and a traceback pins runPipeline's frame — its pipeline, device and
+            # queues — until the main thread lets go of it. Their native destructors would
+            # then run on the main thread, possibly after a retry reopened the device.
+            # A fresh PipelineError is raised below, after the teardown, instead.
+            import traceback
+            failure = formatTaskError(exc) or type(exc).__name__
+            with self._lock:
+                self._lastTraceback = traceback.format_exc()
+            traceback.clear_frames(exc.__traceback__)
         finally:
-            self.closeDevice(handles['pipeline'], handles['device'])  # type: ignore[arg-type]
-            if handles['device'] is not None or handles['pipeline'] is not None:
-                # device.close() returns before XLink finishes tearing down natively —
-                # keep the alive-gate held so no deferred Start can reopen into that
-                # window (observed to hard-crash TD).
-                time.sleep(POST_CLOSE_SETTLE_S)
-            self._workerAlive.clear()
+            try:
+                # The run is over the moment the loop exits: don't keep reporting
+                # Connected/Fps through the seconds the teardown below takes.
+                self.pushStatus(False)
+                self.setStatus('Closing device...')
+                opened = handles['device'] is not None or handles['pipeline'] is not None
+                close(handles['pipeline'], handles['device'])  # type: ignore[arg-type]
+                _hostNodes.nodes = None
+                handles.clear()  # last references die HERE, on the worker
+                if opened:
+                    # device.close() returns before XLink finishes tearing down natively —
+                    # keep the alive-gate held so no deferred Start can reopen into that
+                    # window (observed to hard-crash TD).
+                    sleep(settle)
+            finally:
+                alive.clear()
+        if failure:
+            raise PipelineError(failure)
 
     def runPipeline(self, config: PipelineConfig, stopFlag: threading.Event,
                     handles: dict[str, object]) -> None:
         import depthai as dai
 
+        self.setStatus('Opening device...')
         if config['device']:
             device = dai.Device(dai.DeviceInfo(config['device']))
             handles['device'] = device
@@ -865,26 +1250,80 @@ class OAKManagerExt:
             pipeline = dai.Pipeline()
         handles['pipeline'] = pipeline
 
+        if config['crashDump']:
+            # Opt-in (Crashdump par): if the device firmware crashed during an earlier
+            # connection, it kept a dump — read its summary now, on a fresh connection.
+            # (depthai's own post-close dump check stays disabled via DEPTHAI_CRASHDUMP=0:
+            # that one reconnects DURING teardown and has crashed the host process.)
+            try:
+                dev = pipeline.getDefaultDevice()  # type: ignore[attr-defined]
+                if dev.hasCrashDump():
+                    summary = summarizeCrashDump(dev.getCrashDump())
+                    if summary:
+                        self.setWarning(summary)
+            except Exception as exc:
+                self.setWarning(f'crashdump: {exc}')
+
         # Pre-fetch declared models on a subprocess (its own interpreter = its own GIL) so the
         # download stays off TD's main thread and we can stream a live progress counter. Then
         # point the in-process build at the same cache and skip the online freshness check, so
         # build() loads the cached archive instead of doing a GIL-holding network round-trip.
         platform = pipeline.getDefaultDevice().getPlatformAsString()  # type: ignore[attr-defined]
+        if any(m not in set(config['localModels']) for m in config['models']):
+            self.setStatus('Downloading models...')
         prefetched = self.downloadModels(config, platform, stopFlag)
         # Only trust the cache (skip the online check) when we actually pre-fetched a zoo slug.
         # An all-local pipeline leaves the check on so any incidental zoo resolve still works.
         zooDeclared = any(m not in set(config['localModels']) for m in config['models'])
         # NOTE: process-global environment — this affects every depthai user in the TD process
         # and assumes a single OAK component per project (or identical settings across them).
-        os.environ['DEPTHAI_ZOO_CACHE_PATH']     = config['cacheDir']
-        os.environ['DEPTHAI_ZOO_INTERNET_CHECK'] = '0' if (zooDeclared and prefetched) else '1'
+        # The cache path is set on the main thread before the run starts (startWhenIdle);
+        # this one depends on the prefetch result, so it is written here — but only when
+        # it actually changes: setenv is not thread-safe against native getenv calls.
+        internetCheck = '0' if (zooDeclared and prefetched) else '1'
+        if os.environ.get('DEPTHAI_ZOO_INTERNET_CHECK') != internetCheck:
+            os.environ['DEPTHAI_ZOO_INTERNET_CHECK'] = internetCheck
         if stopFlag.is_set():
             return  # Stop pressed mid-download — don't build/start; cameraPump's finally closes the device
 
-        queues, streamNames, controlQueues = self.buildPipeline(pipeline, config)
+        # depthai auto-injects AutoCalibration/DynamicCalibration/Gate nodes into any pipeline
+        # with a StereoDepth node (library default ON_START). On an OAK-D Lite (RVC2) with
+        # depthai 3.12.2 that crashes the device firmware ~2 s after start() (RTEMS assert in
+        # RefCnt::DecRef on a PlgXLinkIn thread) — every stream drops with 'MessageQueue was
+        # closed' before the first frame. So the Autocalibration par defaults to Off. It is
+        # applied before build(), so a pipeline script can still override it in build().
+        modes = getattr(dai.Pipeline, 'AutoCalibrationMode', None)
+        if modes is not None and hasattr(pipeline, 'setAutoCalibrationMode'):
+            mode = {'off':        getattr(modes, 'OFF', None),
+                    'onstart':    getattr(modes, 'ON_START', None),
+                    'continuous': getattr(modes, 'CONTINUOUS', None),
+                    }.get(config['autoCalibration'], getattr(modes, 'OFF', None))
+            if mode is not None:
+                try:
+                    pipeline.setAutoCalibrationMode(mode)  # type: ignore[attr-defined]
+                except Exception as exc:
+                    self.setWarning(f"autocalibration: could not set '{config['autoCalibration']}' "
+                                    f'({exc}) - depthai uses its default (On Start), which '
+                                    'crashes some devices right after start')
+        elif config['autoCalibration'] != 'onstart':
+            self.setWarning('autocalibration: this depthai version has no per-pipeline switch - '
+                            'the Auto Calibration parameter has no effect')
+
+        self.setStatus('Starting pipeline...')
+        # Python host nodes built by the script must outlive build(): they are parked in
+        # the run's handles and released with them in the teardown.
+        _hostNodes.nodes = handles.setdefault('hostNodes', [])
+        keepAlive = installHostNodeKeepAlive(dai)
+        queues, streamNames, controlQueues, startedFn = self.buildPipeline(pipeline, config)
+        if keepAlive and handles['hostNodes']:
+            self.setWarning('depthai host-node workaround active: this TouchDesigner/depthai '
+                            'combination drops Python host nodes (depthai-nodes) - TDOAK keeps '
+                            'them alive')
         self.pushStatus(False, streams=streamNames)
 
         pipeline.start()
+        if startedFn is not None:
+            startedFn(pipeline, pipeline.getDefaultDevice())  # type: ignore[attr-defined]
         # Cap the device's log chatter (temperatures, cpu usage, ...) to the configured
         # verbosity — setLogLevel gates device->host transfer, setLogOutputLevel printing.
         with suppress(Exception):
@@ -897,9 +1336,18 @@ class OAKManagerExt:
                 dev.setLogLevel(level)
                 dev.setLogOutputLevel(level)
         self.cacheIntrinsics(pipeline.getDefaultDevice())  # type: ignore[attr-defined]
+        self.readDeviceInfo(pipeline.getDefaultDevice())   # type: ignore[attr-defined]
         with self._lock:
             self._controlQueues = controlQueues
-        self.pushStatus(True, streams=streamNames)
+        # Connected means FRAMES ARE ARRIVING, not 'pipeline.start() returned': a device
+        # that accepts the pipeline and then sends nothing must not look healthy. It turns
+        # on with the first message below; until then the watchdog's first-frame timer runs.
+        self.setStatus('Waiting for the first frame...')
+        watchdog = FrameWatchdog(config['firstFrameTimeout'], config['stallTimeout'], queues)
+        firstFrameAt: float | None = None
+        lastClockAt:  float        = time.monotonic()
+        lastAgesAt:   float        = lastClockAt
+        fpsShown:     float        = 0.0
 
         frameCount: int   = 0
         fpsTimer:   float = time.monotonic()
@@ -917,10 +1365,16 @@ class OAKManagerExt:
                 if msg is None:
                     continue
                 got = True
+                watchdog.mark(name)
+                if firstFrameAt is None:
+                    firstFrameAt = time.monotonic()
+                    self.pushStatus(True, streams=streamNames)
+                    self.setStatus('Streaming')
 
                 if name == clockStream:
                     frameCount += 1
                     now     = time.monotonic()
+                    lastClockAt = now
                     elapsed = now - fpsTimer
                     if elapsed >= 1.0:
                         fps = frameCount / elapsed
@@ -933,10 +1387,10 @@ class OAKManagerExt:
                             latencyMs = 0.0
                         self.pushStatus(True, fps=fps, latency=latencyMs,
                                         streams=streamNames)
+                        fpsShown   = fps
                         frameCount = 0
                         fpsTimer   = now
-                        tdThread.SetProgressSafe(  # type: ignore[attr-defined]
-                            min(fps / config['fps'], 1.0) if config['fps'] else 0.5)
+                        tdThread.SetProgressSafe(1.0)  # type: ignore[attr-defined]
 
                 # Skip decoding streams nobody consumes (no binding, never pulled via
                 # GetFrame) — the queue is still drained so the device never backs up.
@@ -954,7 +1408,7 @@ class OAKManagerExt:
                     try:
                         data = parseFn(msg)
                     except Exception as exc:
-                        self.setError(f'parse[{name}]: {exc}')
+                        self.setWarning(f'parse[{name}]: {exc}')
                         continue
                     if data is not None:
                         self.pushFrame(name, data)
@@ -966,18 +1420,74 @@ class OAKManagerExt:
                 if kind is None:
                     kind = self.classifyMessage(msg)
                     kinds[name] = kind
+                    if kind == 'unknown':
+                        self.setWarning(f"stream '{name}': no built-in decoder for "
+                                        f'{type(msg).__name__} messages - attach a Handler DAT '
+                                        'with a parse(msg) to this stream')
                 try:
                     data = self._decoders[kind](msg, name)
                 except Exception as exc:
-                    self.setError(f'decode[{type(msg).__name__}]: {exc}')
+                    self.setWarning(f'decode[{type(msg).__name__}]: {exc}')
                     continue
                 if data is not None:
                     self.pushFrame(name, data)
 
             if not got:
+                now = time.monotonic()
+                if firstFrameAt is not None:
+                    with self._lock:
+                        self._streamedFor = now - firstFrameAt
+                # The Fps readout must not freeze at its last value when frames stop.
+                if fpsShown and now - lastClockAt >= FPS_IDLE_RESET_S:
+                    fpsShown = 0.0
+                    self.pushStatus(firstFrameAt is not None, streams=streamNames)
+                if now - lastAgesAt >= 1.0:
+                    lastAgesAt = now
+                    with self._lock:
+                        self._streamAges = watchdog.ages()
+                    for silent in watchdog.silentStreams():
+                        self.setWarning(f"stream '{silent}' stopped delivering while others "
+                                      'still flow - check its sensor/node (a starved input '
+                                      'also blocks everything behind a Sync node)')
+                # No frames at all (never, or not any more) fails the run: it goes through
+                # onExcept, so it is reported and retried like any other pipeline error.
+                problem = watchdog.check()
+                if problem:
+                    raise PipelineError(problem)
                 # Sleep only when a full pass found nothing: bursts drain at full speed,
                 # while an idle pipeline doesn't spin thousands of wakeups per second.
                 time.sleep(POLL_IDLE_SLEEP_S)
+
+        if firstFrameAt is not None:
+            with self._lock:
+                self._streamedFor = time.monotonic() - firstFrameAt
+        if not stopFlag.is_set():
+            # The loop ended although nobody pressed Stop: pipeline.isRunning() turned
+            # False by itself. That is a lost device or a firmware crash, never a clean
+            # stop — fail the run so it is reported and retried instead of ending silently.
+            raise PipelineError('pipeline stopped by itself - the device was lost or its '
+                                'firmware crashed')
+
+    def readDeviceInfo(self, device: object) -> None:
+        """WORKER thread. Name, platform and link speed of the connected device for the
+        Deviceinfo readout. A USB device below SuperSpeed is called out: a USB2 cable or
+        port is the most common cause of stalls that look like firmware crashes."""
+        name = platform = protocol = ''
+        usbSpeed: str | None = None
+        with suppress(Exception):
+            name = str(device.getDeviceName())  # type: ignore[attr-defined]
+        with suppress(Exception):
+            platform = str(device.getPlatformAsString())  # type: ignore[attr-defined]
+        with suppress(Exception):
+            protocol = coreDevice.enumName(device.getDeviceInfo().protocol)  # type: ignore[attr-defined]
+        if 'USB' in protocol.upper():
+            with suppress(Exception):
+                usbSpeed = coreDevice.enumName(device.getUsbSpeed())  # type: ignore[attr-defined]
+        text, warning = coreDevice.describeDevice(name, platform, protocol, usbSpeed)
+        with self._lock:
+            self._deviceInfo = text
+        if warning:
+            self.setWarning(warning)
 
     # ── Built-in decoders (WORKER thread, uniform (msg, name) signature) ──
     # Zero-config defaults keyed off the message type, not the stream name. A per-stream
@@ -991,7 +1501,7 @@ class OAKManagerExt:
         global _NODE_IMPORT_ERROR
         types = _nodeMessageTypes()
         if _NODE_IMPORT_ERROR:
-            self.setError(_NODE_IMPORT_ERROR)  # broken install ≠ not installed — surface it
+            self.setWarning(_NODE_IMPORT_ERROR)  # broken install ≠ not installed — surface it
             _NODE_IMPORT_ERROR = None
         for kind, clsName in _NODE_KINDS:
             cls = types.get(clsName)
@@ -1006,68 +1516,28 @@ class OAKManagerExt:
         return 'unknown'
 
     def decodeDetections(self, msg: object, name: str) -> list[PoseEntry] | list[DetectionEntry]:
-        dets = msg.detections  # type: ignore[attr-defined]
-        # Pose models (YOLOv8-pose) carry per-detection keypoints; plain object detectors
-        # return empty keypoints. Route on that so one branch serves both without depending
-        # on the stream name.
-        if dets and dets[0].getKeypoints2f():
-            edges: list[list[int]] = [list(e) for e in dets[0].getEdges()]
-            return [
-                PoseEntry(
-                    confidence= round(d.confidence, 3),
-                    box=        [d.xmin, d.ymin, d.xmax, d.ymax],
-                    keypoints=  [[p.x, p.y] for p in d.getKeypoints2f()],
-                    edges=      edges,
-                )
-                for d in dets
-            ]
-        return [
-            DetectionEntry(
-                label=      d.label,
-                confidence= round(d.confidence, 3),
-                xmin=       d.xmin,
-                ymin=       d.ymin,
-                xmax=       d.xmax,
-                ymax=       d.ymax,
-            )
-            for d in dets
-        ]
+        # Pose models carry per-detection keypoints (-> PoseEntry), plain detectors don't
+        # (-> DetectionEntry); spatial detections add x/y/z in millimetres. Routed on the
+        # message content, never on the stream name.
+        return coreDecode.decodeDetections(msg.detections)  # type: ignore[attr-defined,return-value]
 
     def decodeImu(self, msg: object, name: str) -> ImuData | None:
-        if not msg.packets:  # type: ignore[attr-defined]
-            return None
-        p   = msg.packets[-1]  # type: ignore[attr-defined]
-        acc = p.acceleroMeter if hasattr(p, 'acceleroMeter') else p.accelerometer
-        return ImuData(
-            accel= [acc.x, acc.y, acc.z],
-            gyro=  [p.gyroscope.x, p.gyroscope.y, p.gyroscope.z],
-        )
+        return coreDecode.decodeImu(msg.packets)  # type: ignore[attr-defined,return-value]
 
     def decodePointCloud(self, msg: object, name: str) -> np.ndarray:
-        # getPoints() may return (N, 3) or a flat (N*3,) array depending on the
-        # depthai build (3.6.1 returns flat) — normalise to (N, 3) first.
-        pts: np.ndarray = np.asarray(msg.getPoints(),  # type: ignore[attr-defined]
-                                     dtype=np.float32).reshape(-1, 3)
-        # Organized cloud → reshape to the sensor grid so it's TOP-ready
-        # and pixel-aligned with depth/amplitude (flipud to match their origin).
+        # Organized cloud -> the sensor grid, TOP-ready and pixel-aligned with
+        # depth/amplitude; the companion image grid is the fallback when the message's own
+        # width/height are unreliable.
         w: int = int(msg.getWidth())  if hasattr(msg, 'getWidth')  else 0  # type: ignore[attr-defined]
         h: int = int(msg.getHeight()) if hasattr(msg, 'getHeight') else 0  # type: ignore[attr-defined]
-        if w * h != pts.shape[0] and self._lastImageHW is not None:
-            # getWidth/getHeight unreliable on some builds → fall back to the
-            # companion ToF image grid (depth/amplitude share the sensor res).
-            ih, iw = self._lastImageHW
-            if ih * iw == pts.shape[0]:
-                h, w = ih, iw
-        if w > 0 and h > 0 and w * h == pts.shape[0]:
-            pts = np.flipud(pts.reshape(h, w, 3))
-        return np.ascontiguousarray(pts)
+        return coreDecode.organizePointCloud(msg.getPoints(), w, h, self._lastImageHW)  # type: ignore[attr-defined]
 
     def decodeImage(self, msg: object, name: str) -> np.ndarray:
-        frame: np.ndarray = np.flipud(msg.getCvFrame())  # type: ignore[attr-defined]
-        if name == 'rgb':
-            frame = frame[..., ::-1]
+        # getCvFrame() is OpenCV-style: top-down, BGR. TouchDesigner wants bottom-up RGB —
+        # for EVERY colour stream, whatever it is called (mono/depth frames only flip).
+        frame = coreDecode.toTdImage(msg.getCvFrame())  # type: ignore[attr-defined]
         self._lastImageHW = (frame.shape[0], frame.shape[1])
-        return np.ascontiguousarray(frame)
+        return frame
 
     def decodeRawFrame(self, msg: object, name: str) -> np.ndarray:
         return np.ascontiguousarray(msg.getFrame())  # type: ignore[attr-defined]
@@ -1086,7 +1556,7 @@ class OAKManagerExt:
     def decodeExtendedDetections(self, msg: object, name: str) -> list[ExtendedDetectionEntry]:
         out: list[ExtendedDetectionEntry] = []
         for d in msg.detections:                       # type: ignore[attr-defined]
-            box, angle = _rotatedRectBox(d.rotated_rect)
+            box, angle = coreDecode.rotatedRectBox(d.rotated_rect)
             out.append(ExtendedDetectionEntry(
                 label=      int(d.label),
                 confidence= round(float(d.confidence), 3),
@@ -1146,12 +1616,17 @@ class OAKManagerExt:
             self._intrinsics = result
 
     def buildPipeline(self, pipeline: _Pipeline, config: PipelineConfig,
-                       ) -> tuple[dict[str, _OutputQueue], list[str], dict[str, _InputQueue]]:
-        """No TD objects. Populates pipeline with nodes, returns ({name: out_queue}, [stream_names], {name: in_queue})."""
+                       ) -> tuple[dict[str, _OutputQueue], list[str], dict[str, _InputQueue],
+                                  Callable[[object, object], None] | None]:
+        """No TD objects. Populates pipeline with nodes, returns ({name: out_queue},
+        [stream_names], {name: in_queue}, started-hook or None)."""
         import depthai as dai
 
         if config['pipelineScript']:
-            namespace: dict[str, object] = {'dai': dai}
+            # In scope for the script: dai, and PROJECT_FOLDER (the .toe's folder) — the
+            # script runs on the worker, where TouchDesigner's `project` doesn't exist.
+            namespace: dict[str, object] = {'dai': dai,
+                                            'PROJECT_FOLDER': config['projectFolder']}
             # compile() with the DAT's path so a build() traceback points at the real DAT,
             # not '<string>'.
             exec(compile(config['pipelineScript'],
@@ -1166,7 +1641,11 @@ class OAKManagerExt:
             else:
                 queues, streams = result
                 controls = {}
-            return queues, streams, controls
+            # Optional: def started(pipeline, device) — called on the worker right after
+            # pipeline.start(), for device calls that only work on a running pipeline
+            # (IR dot projector / flood light intensity, ...).
+            startedFn = namespace.get('started')
+            return queues, streams, controls, (startedFn if callable(startedFn) else None)  # type: ignore[return-value]
 
         queues:   dict[str, _OutputQueue] = {}
         streams:  list[str]               = []
@@ -1174,11 +1653,9 @@ class OAKManagerExt:
 
         device       = pipeline.getDefaultDevice()  # type: ignore[attr-defined]
         camFeatures  = device.getConnectedCameraFeatures()
-        primaryTypes = [
-            f.supportedTypes for f in camFeatures
-            if f.socket == dai.CameraBoardSocket.CAM_A
-        ]
-        isTof = bool(primaryTypes and dai.CameraSensorType.TOF in primaryTypes[0])
+        bySocket     = {f.socket: f for f in camFeatures}
+        camA         = bySocket.get(dai.CameraBoardSocket.CAM_A)
+        isTof = camA is not None and dai.CameraSensorType.TOF in camA.supportedTypes
 
         if isTof:
             tofNode = pipeline.create(dai.node.ToF).build(dai.CameraBoardSocket.CAM_A)  # type: ignore[attr-defined,union-attr]
@@ -1186,36 +1663,57 @@ class OAKManagerExt:
             streams.append('depth')
             controls['tof_cfg'] = tofNode.tofBaseInputConfig.createInputQueue(maxSize=1, blocking=False)  # type: ignore[attr-defined]
         else:
-            cam    = pipeline.create(dai.node.Camera).build()
-            rgbOut = cam.requestOutput(DEFAULT_RGB_RESOLUTION)
+            if not camFeatures:
+                raise PipelineError('this device reports no cameras - the built-in pipeline '
+                                    'has nothing to stream')
+            cam = pipeline.create(dai.node.Camera).build()
+            # Never ask for more than the sensor has: a 1280x800 colour sensor (OAK-D SR,
+            # OAK-D Pro W) can't serve the 1920x1080 default.
+            sensor = bySocket.get(cam.getBoardSocket()) if hasattr(cam, 'getBoardSocket') else camA
+            size = coreDecode.fitResolution(
+                DEFAULT_RGB_RESOLUTION,
+                (getattr(sensor, 'width', 0), getattr(sensor, 'height', 0)))
+            rgbOut = cam.requestOutput(size)
             queues['rgb'] = rgbOut.createOutputQueue()
             streams.append('rgb')
             controls['cam_ctrl'] = cam.inputControl.createInputQueue(maxSize=1, blocking=False)  # type: ignore[attr-defined]
 
             if config['enableDepth']:
-                left   = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
-                right  = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
-                stereo = pipeline.create(dai.node.StereoDepth)
-                stereo.setRectification(True)
-                stereo.setLeftRightCheck(True)
-                left.requestFullResolutionOutput().link(stereo.left)
-                right.requestFullResolutionOutput().link(stereo.right)
-                queues['depth'] = stereo.depth.createOutputQueue()
-                streams.append('depth')
-                controls['stereo_cfg'] = stereo.inputConfig.createInputQueue(maxSize=1, blocking=False)  # type: ignore[attr-defined]
+                hasPair = (dai.CameraBoardSocket.CAM_B in bySocket
+                           and dai.CameraBoardSocket.CAM_C in bySocket)
+                if not hasPair:
+                    self.setWarning('Enable Depth ignored: this device has no stereo pair on '
+                                    'CAM_B/CAM_C')
+                else:
+                    left   = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
+                    right  = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
+                    stereo = pipeline.create(dai.node.StereoDepth)
+                    stereo.setRectification(True)
+                    stereo.setLeftRightCheck(True)
+                    left.requestFullResolutionOutput().link(stereo.left)
+                    right.requestFullResolutionOutput().link(stereo.right)
+                    queues['depth'] = stereo.depth.createOutputQueue()
+                    streams.append('depth')
+                    controls['stereo_cfg'] = stereo.inputConfig.createInputQueue(maxSize=1, blocking=False)  # type: ignore[attr-defined]
 
             if config['enableImu']:
-                imu = pipeline.create(dai.node.IMU)
-                imu.enableIMUSensor([
-                    dai.IMUSensor.ACCELEROMETER_RAW,
-                    dai.IMUSensor.GYROSCOPE_RAW,
-                ], reportRate=IMU_REPORT_RATE_HZ)
-                imu.setBatchReportThreshold(IMU_BATCH_THRESHOLD)
-                imu.setMaxBatchReports(IMU_MAX_BATCH_REPORTS)
-                queues['imu'] = imu.out.createOutputQueue()
-                streams.append('imu')
+                imuType = ''
+                with suppress(Exception):
+                    imuType = str(device.getConnectedIMU())
+                if imuType.strip().upper() in ('', 'NONE'):
+                    self.setWarning('Enable IMU ignored: this device has no IMU')
+                else:
+                    imu = pipeline.create(dai.node.IMU)
+                    imu.enableIMUSensor([
+                        dai.IMUSensor.ACCELEROMETER_RAW,
+                        dai.IMUSensor.GYROSCOPE_RAW,
+                    ], reportRate=IMU_REPORT_RATE_HZ)
+                    imu.setBatchReportThreshold(IMU_BATCH_THRESHOLD)
+                    imu.setMaxBatchReports(IMU_MAX_BATCH_REPORTS)
+                    queues['imu'] = imu.out.createOutputQueue()
+                    streams.append('imu')
 
-        return queues, streams, controls
+        return queues, streams, controls, None
 
     # ── Stream menu + scriptop dispatch (main thread) ────────────────────
 
@@ -1223,9 +1721,7 @@ class OAKManagerExt:
         """Main thread. Resize the readonly Models sequence to one block per declared model and
         fill in each Model name, resetting Progress to 0. Grow with numBlocks (the documented
         'press +' equivalent) and shrink with destroyBlock from the tail."""
-        seq = getattr(self.ownerComp.seq, 'Models', None)
-        if seq is None:
-            return
+        seq = self.ownerComp.seq.Models
         needed = len(models)
         while seq.numBlocks < needed:
             seq.numBlocks += 1
@@ -1244,8 +1740,8 @@ class OAKManagerExt:
         once every model reports complete."""
         if self._modelsDone:
             return
-        seq = getattr(self.ownerComp.seq, 'Models', None)
-        if seq is None or len(seq) == 0:
+        seq = self.ownerComp.seq.Models
+        if len(seq) == 0:
             return
         with self._lock:
             progress = dict(self._modelProgress)
@@ -1269,8 +1765,8 @@ class OAKManagerExt:
         if streamNames == self._lastStreamNames:
             return
         self._lastStreamNames = list(streamNames)
-        seq = getattr(self.ownerComp.seq, 'Streams', None)
-        if seq is None or len(seq) == 0:
+        seq = self.ownerComp.seq.Streams
+        if len(seq) == 0:
             return
         current = [seq.blockPars.Stream[i].eval() for i in range(len(seq))]
         menu = list(dict.fromkeys(list(streamNames) + [c for c in current if c]))
@@ -1288,13 +1784,12 @@ class OAKManagerExt:
         the worker uses to skip decoding streams nobody consumes (the Fps readout is unaffected:
         the worker meters its clock stream before the wanted-filter)."""
         bindings: list[tuple[str, OP]] = []
-        seq = getattr(self.ownerComp.seq, 'Streams', None)
-        if seq is not None:
-            for i in range(len(seq)):
-                streamName: str       = seq.blockPars.Stream[i].eval()
-                targetOp:   OP | None = seq.blockPars.Scriptop[i].eval()
-                if streamName and targetOp is not None:
-                    bindings.append((streamName, targetOp))
+        seq = self.ownerComp.seq.Streams
+        for i in range(len(seq)):
+            streamName: str       = seq.blockPars.Stream[i].eval()
+            targetOp:   OP | None = seq.blockPars.Scriptop[i].eval()
+            if streamName and targetOp is not None:
+                bindings.append((streamName, targetOp))
         for streamName, opList in self._scriptopRegistry.items():
             for targetOp in opList:
                 if (streamName, targetOp) not in bindings:
@@ -1343,7 +1838,7 @@ class OAKManagerExt:
             try:
                 filler(targetOp, data)
             except Exception as exc:
-                self.setError(f'fill[{streamName}]: {exc}')
+                self.setWarning(f'fill[{streamName}]: {exc}')
             return
         # No custom fill: built-in defaults — numpy image -> Script TOP, float point
         # array -> Script POP (its staging API works outside the cook, no toggle needed).
@@ -1357,7 +1852,7 @@ class OAKManagerExt:
             try:
                 self.fillPopPoints(targetOp, data)  # type: ignore[arg-type]
             except Exception as exc:
-                self.setError(f'fill[{streamName}]: {exc}')
+                self.setWarning(f'fill[{streamName}]: {exc}')
 
     def isPointArray(self, data: FrameData | None) -> bool:
         """A float (N, 3) or organized (H, W, 3) array — point positions, as produced by
@@ -1411,23 +1906,20 @@ class OAKManagerExt:
         """Hash of the handler-relevant Streams state — block count plus each block's Stream,
         Scriptop path, and Handler DAT text. Changes when a block/binding/handler is added,
         removed, or edited, so Autoreload can hot-reload handlers without a full Rebuild."""
-        seq = getattr(self.ownerComp.seq, 'Streams', None)
-        if seq is None:
-            return hash(())
+        seq = self.ownerComp.seq.Streams
         parts: list[object] = []
         for i in range(len(seq)):
             stream   = seq.blockPars.Stream[i].eval()
             scriptop = seq.blockPars.Scriptop[i].eval()
-            try:
-                handler = seq.blockPars.Handler[i].eval()
-            except Exception:
-                handler = None  # Handler param not added on this build
+            handler  = seq.blockPars.Handler[i].eval()
             parts.append((stream,
                           scriptop.path if scriptop is not None else None,
                           handler.text if handler is not None else None))
         return hash(tuple(parts))
 
     def onRefresh(self) -> None:
+        if not self.isOwner():
+            return  # superseded by a re-init: the new instance drives the pars now
         # Throttled maintenance: hashing the pipeline DAT + every Handler DAT and walking the
         # Streams sequence are per-cook costs that exist only to catch rare edits — every
         # MAINTENANCE_PERIOD cooks (~0.5 s) is plenty, and register/reload calls rebuild the
@@ -1437,11 +1929,10 @@ class OAKManagerExt:
             self._refreshTick   = 0
             self._bindingsDirty = False
             if self.ownerComp.par.Autoreload.eval():
-                datRef: str = self.ownerComp.par.Pipelinedat.eval()
-                if datRef:
-                    dat = op(datRef)
+                dat = self.ownerComp.par.Pipelinedat.eval()
+                if dat is not None:
                     version = self.datContentHash(dat)
-                    if dat and version != self._datVersion:
+                    if version != self._datVersion:
                         self._datVersion = version
                         self.Rebuild()           # pipeline build() changed → full restart
                         return
@@ -1464,8 +1955,13 @@ class OAKManagerExt:
             par.Fps = fps
         if par.Activestreams.eval() != streams:
             par.Activestreams = streams
-        if par.Lasterror.eval() != status['error']:
-            par.Lasterror = status['error']
+        self.mirrorErrors()
+        if par.Status.eval() != status['status']:
+            par.Status = status['status']
+        with self._lock:
+            info = self._deviceInfo
+        if par.Deviceinfo.eval() != info:
+            par.Deviceinfo = info
         self.updateStreamMenus(status['streams'])
         self.updateModelProgress()
         self.pushToScriptops()
@@ -1474,6 +1970,10 @@ class OAKManagerExt:
         """WORKER thread (cameraPump's finally). Release one run's pipeline + device handles.
         They arrive as per-run locals — never read from instance state — so a dying run can
         only ever close its own device. Safe on a half-built pipeline."""
+        # Unpublish the control queues FIRST: SendControl/SendFrame run on the main thread
+        # (SendFrame every frame) and must not send into a pipeline that is tearing down.
+        with self._lock:
+            self._controlQueues = {}
         if pipeline is not None:
             with suppress(Exception):
                 pipeline.stop()
@@ -1486,39 +1986,57 @@ class OAKManagerExt:
             with suppress(Exception):
                 device.close()
         with self._lock:
-            self._intrinsics    = {}
-            self._controlQueues = {}
+            self._intrinsics = {}
 
     def onSuccess(self) -> None:
         # Device already released on the worker (cameraPump's finally) — this hook runs on
         # the main thread, so it must not call the blocking close itself.
         self.pushStatus(False)
+        if not self.isOwner():
+            return
         self.ownerComp.par.Connected = 0
+        self.ownerComp.par.Fps = 0
+        self.mirrorErrors()  # a warning the worker set in its last moments
+        self.setStatus('Stopped')
 
     def onExcept(self, *args: object) -> None:
         # Device already released on the worker (cameraPump's finally), so the retry can't
         # reopen a still-open (PoE) handle. Don't close here — this hook is on the main thread.
         # A cancelled task can hand the hook a bare None — that's not an error message.
-        errorMsg: str = str(args[0]) if args and args[0] is not None else ''
+        errorMsg: str = withHint(formatTaskError(args[0])) if args and args[0] else ''
         self.pushStatus(False)
+        if not self.isOwner():
+            return  # superseded by a re-init — the new instance decides about restarts
+        self.mirrorErrors()
+        self.ownerComp.par.Connected = 0
+        self.ownerComp.par.Fps = 0
 
-        if self._workerShared['stop'].is_set():
+        if self.stopEvent().is_set():
             # Stop was pressed while the pipeline was failing — honor it, no retry.
             if errorMsg:
                 self.setError(errorMsg)
+            self.setStatus('Stopped')
             return
         if not errorMsg:
             errorMsg = 'Unknown error'
 
-        self._retryCount += 1
-        if self._retryCount >= MAX_RETRIES:
-            self.setError(f'Pipeline failed after {MAX_RETRIES} attempts — '
-                          f'press Start to retry. Last error: {errorMsg}')
+        with self._lock:
+            ranFor = self._streamedFor
+        delay = self._retry.onFailure(ranFor)
+        if delay is None:
+            if self._retry.mode == 'limited':
+                self.setError(f'Pipeline failed {self._retry.failures} times in a row - '
+                              f'press Start to retry. Last error: {errorMsg}')
+            else:
+                self.setError(errorMsg)
+            self.setStatus('Failed - press Start')
             return
 
         self.setError(errorMsg)
-        delayFrames: int = int(RECONNECT_DELAY_S * self.ownerComp.time.rate)
-        run('args[0].doStart()', self, delayFrames=delayFrames, fromOP=self.ownerComp)
+        self.setStatus(f'Retrying in {delay:g} s ({self._retry.describe()})')
+        delayFrames: int = int(delay * self.ownerComp.time.rate)
+        run('args[0].delayedStart(args[1])', self, self._startToken,
+            delayFrames=delayFrames, fromOP=self.ownerComp)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -1528,9 +2046,9 @@ class OAKManagerExt:
         A parse(msg) the handler defines is installed as the stream's worker-side decoder
         (idempotent, same slot component registrations use, so it survives seq reloads).
         Returns the handler's fill, or None (missing DAT / exec error / fill-less handler)."""
-        dat = op(handler) if isinstance(handler, str) else handler
+        dat = self.ownerComp.op(handler) if isinstance(handler, str) else handler
         if dat is None or not dat.valid:
-            self.setError(f'pull[{streamName}]: handler DAT {handler!r} not found')
+            self.setWarning(f'pull[{streamName}]: handler DAT {handler!r} not found')
             return None
         version = hash(dat.text)
         cached = self._pullHandlers.get(dat.path)
@@ -1563,91 +2081,57 @@ class OAKManagerExt:
         try:
             exec(compile(handlerDat.text, handlerDat.path, 'exec'), namespace)
         except Exception as exc:
-            self.setError(f'handler[{label}]: {exc}')
+            self.setWarning(f'handler[{label}]: {exc}')
             return None
         parseFn = namespace.get('parse')
         fillFn  = namespace.get('fill')
         return (parseFn if callable(parseFn) else None,   # type: ignore[return-value]
                 fillFn  if callable(fillFn)  else None)
 
+    def selectedDevice(self) -> str:
+        """Main thread. The device to open: the hand-typed Device Address (MXID or IP — for
+        a PoE camera discovery can't see) when set, else the Device menu selection.
+        '' means 'first available'."""
+        address: str = self.ownerComp.par.Deviceaddress.eval().strip()
+        if address:
+            return address
+        selected: str = self.ownerComp.par.Device.eval().strip()
+        return '' if selected in ('', 'None') else selected
+
     def readConfig(self) -> PipelineConfig:
         par = self.ownerComp.par
-        datRef: str = par.Pipelinedat.eval()
-        dat = op(datRef) if datRef else None
-        rawDevice: str = par.Device.eval().strip()
-        device: str = '' if rawDevice in ('', 'None') else rawDevice
-        # Loglevel is an optional custom par (older comps may not have it) — default 'warn'
-        # silences depthai's periodic [info] chatter (temperatures, cpu usage, ...).
-        logPar = getattr(par, 'Loglevel', None)
-        logLevel: str = str(logPar.eval()) if logPar is not None else 'warn'
+        dat = par.Pipelinedat.eval()
+        device: str = self.selectedDevice()
+        script: str | None = dat.text if dat else None
+        # Module-level literals of the pipeline script, read with ast (never exec'd): the
+        # models to pre-fetch, and optional watchdog overrides — a host-frame pipeline sets
+        # STALL_TIMEOUT_S = 0 because it legitimately sends nothing until it is fed.
+        try:
+            constants = coreModels.scanConstants(script)
+        except SyntaxError as exc:
+            self.setWarning(f'pipeline[scan]: {exc}')
+            constants = {}
         # All TD reads happen here on the main thread; the worker (which can't touch TD)
         # gets everything via this config dict.
         projFolder: str = project.folder
-        venvSub = ('Scripts', 'python.exe') if os.name == 'nt' else ('bin', 'python')
         return PipelineConfig(
             device=         device,
-            fps=            int(par.Fps.eval()),
-            logLevel=       logLevel,
+            firstFrameTimeout= coreModels.timeoutOverride(
+                constants, 'FIRST_FRAME_TIMEOUT_S', par.Firstframetimeout.eval()),
+            stallTimeout=   coreModels.timeoutOverride(
+                constants, 'STALL_TIMEOUT_S', par.Stalltimeout.eval()),
+            crashDump=      bool(par.Crashdump.eval()),
+            logLevel=       str(par.Loglevel.eval()),
+            autoCalibration= str(par.Autocalibration.eval()),
             enableDepth=    bool(par.Enabledepth.eval()),
             enableImu=      bool(par.Enableimu.eval()),
-            pipelineScript= dat.text if dat else None,
+            pipelineScript= script,
             pipelinePath=   dat.path if dat else '',
-            models=         [],  # filled in startWhenIdle via readPipelineModels()
+            models=         coreModels.declaredModels(constants),
             localModels=    [],  # filled in startWhenIdle via localModels()
+            projectFolder=  projFolder,
             cacheDir=       os.path.join(projFolder, '.depthai_cached_models'),
-            venvPython=     os.path.join(projFolder, '.venv', *venvSub),
         )
-
-    def readPipelineModels(self, config: PipelineConfig) -> list[str]:
-        """Main thread. Statically extract the models a pipeline script declares via a
-        module-level ``MODELS = [...]`` (a bare ``MODEL = '...'`` is also accepted). The script
-        is parsed with ast — never exec'd — so the scan has no side effects, can't run
-        module-level code a second time, and needs no namespace seeding. Name references
-        between module-level assignments (``MODELS = [MODEL_A, MODEL_B]``) are resolved;
-        anything computed is skipped (build() then just resolves it inline)."""
-        script = config['pipelineScript']
-        if not script:
-            return []
-        try:
-            tree = ast.parse(script)
-        except SyntaxError as exc:
-            self.setError(f'models[scan]: {exc}')
-            return []
-        env: dict[str, object] = {}
-        for node in tree.body:
-            if isinstance(node, ast.Assign):
-                targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
-                value   = node.value
-            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-                targets = [node.target.id]
-                value   = node.value
-            else:
-                continue
-            if not targets or value is None:
-                continue
-            try:
-                resolved = self.resolveLiteral(value, env)
-            except ValueError:
-                continue  # computed value — not statically resolvable
-            for name in targets:
-                env[name] = resolved
-        decl = env.get('MODELS', env.get('MODEL'))
-        if isinstance(decl, str):
-            decl = [decl]
-        if not isinstance(decl, (list, tuple)):
-            return []
-        return [str(m) for m in decl if m]
-
-    def resolveLiteral(self, node: ast.expr, env: dict[str, object]) -> object:
-        """Literal value of an ast expression, resolving Name references from previously
-        assigned module-level values. Raises ValueError for anything non-literal."""
-        if isinstance(node, ast.Name):
-            if node.id in env:
-                return env[node.id]
-            raise ValueError(node.id)
-        if isinstance(node, (ast.List, ast.Tuple)):
-            return [self.resolveLiteral(e, env) for e in node.elts]
-        return ast.literal_eval(node)
 
     def localModels(self, entries: list[str]) -> set[str]:
         """Main thread. Entries that resolve to an existing file (absolute, or relative to the
@@ -1673,17 +2157,10 @@ class OAKManagerExt:
         component path (RegisterHandler) uses — so a block with no Scriptop set carries no fill."""
         parsers: dict[str, ParseFn] = {}
         fillers: dict[str, FillFn]  = {}
-        seq = getattr(self.ownerComp.seq, 'Streams', None)
-        if seq is None:
-            return parsers, fillers
-        try:
-            seq.blockPars.Handler
-            hasHandler = True
-        except Exception:
-            hasHandler = False  # Handler param not added on this build → defaults only
+        seq = self.ownerComp.seq.Streams
         for i in range(len(seq)):
             streamName: str = seq.blockPars.Stream[i].eval()
-            handlerDat = seq.blockPars.Handler[i].eval() if hasHandler else None
+            handlerDat = seq.blockPars.Handler[i].eval()
             if not streamName or handlerDat is None:
                 continue
             loaded = self.execHandler(handlerDat, f'{streamName}#{i}')

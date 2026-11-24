@@ -6,6 +6,32 @@ on:
   pull_request:
 
 jobs:
+  # Unit tests of the pure-Python core (TDOAK.core, TDOAK.ext loader) and static checks of
+  # the bundled example scripts. No TouchDesigner, no depthai, no camera: everything that
+  # needs those is covered by the manual hardware checklist in the README (Releasing).
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # --no-deps: depthai/opencv wheels are large and the tests never import them.
+      - name: Install package (no dependencies) and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-deps -e .
+          python -m pip install pytest numpy
+
+      - name: Run tests
+        run: python -m pytest -q
+
   build-check:
     runs-on: ubuntu-latest
     steps:
@@ -22,9 +48,12 @@ jobs:
 
       # --no-deps: the smoke test only imports TDOAK itself; depthai/opencv wheels are
       # large and irrelevant to verifying the package layout.
-      - name: Install wheel and verify import
+      - name: Install wheel and verify layout
         run: |
           python -m pip install --no-deps dist/*.whl
-          python -c "import TDOAK; print(TDOAK.__version__, TDOAK.toxPath(), TDOAK.toxPath('TDOAKCamCtl'), TDOAK.examplesPath())"
+          cd "$RUNNER_TEMP"
+          python -c "import TDOAK; print(TDOAK.__version__); [print(n, p) or exit(not p.is_file()) for n, p in TDOAK.toxPaths().items()]; print(TDOAK.examplesPath())"
           python -c "from TDOAK.core.state import workerState; d = workerState('/x'); assert workerState('/x') is d"
           python -c "from TDOAK.core.constants import HAND_CROP_PADDING"
+          python -c "import TDOAK.ext, TDOAK.core.watchdog, TDOAK.core.retry, TDOAK.core.errors, TDOAK.core.decode, TDOAK.core.models, TDOAK.core.device, TDOAK.core.env, TDOAK.core.compat"
+          python -c "import importlib.util as u, TDOAK, pathlib; d = pathlib.Path(TDOAK.__file__).parent / 'ext'; assert (d / 'OAKManagerExt.py').is_file() and (d / 'CameraControlExt.py').is_file()"

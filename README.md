@@ -6,63 +6,137 @@ TouchDesigner extension for OAK cameras via [depthai](https://docs.luxonis.com/s
 
 Supports USB OAK and PoE OAK including OAK-D SR PoE (ToF depth + aligned color) with automatic camera-type detection, plus neural pipelines (object detection, human-pose/skeleton tracking). Pipeline scripts are reloadable DATs. Runtime camera controls (exposure, stereo config, ToF config) can be sent from the main thread at any time while the pipeline is running.
 
-Stream data is decoded off the main thread and pushed into Script Operators. Common streams (rgb, depth, amplitude, detections, pose, imu…) are handled out of the box; any other model's output can be decoded and shaped with a per-stream **Handler DAT** — see [Script OP Integration](#script-op-integration).
+Stream data is decoded off the main thread and delivered into Script Operators. Common streams (rgb, depth, amplitude, detections, pose, imu…) are handled out of the box; any other model's output can be decoded and shaped with a per-stream **Handler DAT** — see [Script OP Integration](#script-op-integration).
 
-Neural models declared by a pipeline are **pre-fetched on a subprocess** before the device pipeline is built, so a Model Zoo download never freezes the UI — progress is reported live in the **Models** sequence. Custom local models (NNArchive/blob on disk) are detected and loaded directly without a download. See [Model Pre-fetch](#model-pre-fetch).
+The component watches the stream: a camera that stops sending, never starts sending, or drops off is reported in **Status** / **Last Error** within seconds and — if you want — reconnected automatically. See [Troubleshooting](#troubleshooting).
 
 ---
 
 ## Requirements
 
 - TouchDesigner 2025.33xxx
+- depthai 3.12.x and depthai-nodes 0.8.x (installed as dependencies; the **About** page says when a different depthai version is loaded)
+- A USB3 cable and port for USB cameras
 
 ---
 
 ## Quick Start
 
-1. Install the package into a Python virtual environment used by TouchDesigner (e.g. one managed by TD's Python Environment Manager). The package is not on a public index, so install straight from GitHub (or from a local clone with pip install <path>):
+1. **Create a Python environment for your project.** Save your project (.toe) first, then add TouchDesigner's Python Environment Manager (`tdPyEnvManager` from the Palette), choose *Python vEnv*, and create the environment **in the project folder with the name `.venv`**. Keep it *active* so it loads with the project.
+2. **Install TDOAK into that environment** (from the environment manager's terminal, or any shell with the venv activated). The package is not on a public index, so install straight from GitHub (or from a local clone with `pip install <path>`):
     ```
     pip install git+https://github.com/TouchDesigner/TDOAK
     ```
     depthai and depthai-nodes are installed as dependencies.
-2. The packaged component (TDOAK.tox) ships inside the package. To load it, create a Base COMP and set its External .tox parameter to the packaged file using an expression:
+3. **Add the component.** Create a Base COMP and set its *External .tox* parameter to this expression:
     ```
     mod.TDOAK.toxPath('TDOAK')
     ```
-3. Click **List Devices** to populate the Device menu.
-4. Select a device (or leave as `-- Select Device --` to use whichever camera connects first).
-5. Click **Start**.
+    (Dragging `TDOAK.tox` into the network works too. The component's code is the installed package — if the environment from step 1 is not active, **Last Error** says so.)
+4. **Add a viewer.** Create a second Base COMP with the External .tox expression `mod.TDOAK.toxPath('TDOAKStream')`, and drag your TDOAK component onto its **OAK Component** parameter. `Stream` is `rgb` by default.
+5. Press **Start** on the TDOAK component.
 
-The component's `Connected`, `Fps`, `Activestreams`, and `Lasterror` parameters update every cook. Reference Script TOPs, CHOPs, SOPs, or DATs on the **Streams** sequential block to receive frame data.
+**Status** walks through *Looking for devices → Opening device → Starting pipeline → Waiting for the first frame → Streaming*, and the image appears in the TDOAKStream component. With no Pipeline DAT set, a built-in pipeline runs with an `rgb` stream (plus `depth`/`imu` when enabled on the Pipeline page; a ToF camera gets a `depth` stream instead).
 
-With no pipeline specified, a default pipeline is run with a `rgb` stream. To see the stream, create a Script TOP, toggle on the Script TOP's `Modify Outside of Cook` parameter and empty out the `onCook` callback. Now reference the Script TOP in the TDOAK's Stream parameters.
-This pushing action is not quite optimal in ways that it happens outside TouchDesigner's cook engine with possible sideeffects. So alternatively, in a Script OP, make use of the TDOAK COMP's `FillScriptOp()` function to pull frame data into Script OPs.
+- Several cameras attached? Press **List Devices** and pick one in **Device**. `-- Select Device --` opens whichever is found first.
+- Changed a setting while streaming? Press **Rebuild** — Start does nothing while a pipeline is running.
+- Nothing happens, or it stops? Read **Status**, **Last Error** and **Last Warning**, then [Troubleshooting](#troubleshooting).
 
-The examples folder has a range of pipeline scripts and handler scripts.
+The examples folder (`mod.TDOAK.examplesPath()`) has a range of pipeline scripts and handler scripts. Other ways to get stream data into operators — the **Streams** sequence, `FillScriptOp()` in your own Script OP, Handler DATs for CHOPs/POPs/DATs — are described under [Script OP Integration](#script-op-integration).
 
 ---
 
 ## Component Parameters
 
+**Device page**
+
 | Parameter | Type | Description |
 |---|---|---|
-| `Device` | Menu | Target device MXID or IP. `-- Select Device --` uses the first available device. Populated by **List Devices**. |
-| `Log Level` | Menu | depthai verbosity (`trace`…`critical`), applied to the device on Start. Default `warn` silences the periodic `[info]` chatter (temperatures, cpu usage). |
-| `Start` | Pulse | Start the camera pipeline. Resets the retry counter. |
-| `Stop` | Pulse | Stop the pipeline cleanly. |
-| `Rebuild` | Pulse | Stop and restart (useful after changing parameters). |
-| `List Devices` | Pulse | Enumerate all visible OAK devices and update the Device menu. |
-| `Reload Handlers` | Pulse | Hot-reload the Streams blocks' Handler DATs (`parse`/`fill`) into the **running** pipeline — applies handler/binding edits without a restart. See [Script OP Integration](#script-op-integration). |
-| `Pipeline DAT` | DAT ref | Optional custom pipeline script. See [Pipeline Scripts](#pipeline-scripts). Leave empty for the built-in auto-detect pipeline. |
-| `Auto Reload` | Toggle | When enabled, automatically rebuilds when the Pipeline DAT changes. |
-| `Enable Depth` | Toggle | Enable stereo depth output on RGB cameras (ignored for ToF devices). |
-| `Enable IMU` | Toggle | Enable IMU output (accelerometer + gyroscope) on RGB cameras. |
-| `Fps` | Float (read-only) | Measured frame rate, updated once per second. |
-| `Connected` | Toggle (read-only) | `1` while the pipeline is running and connected. |
+| `Device` | Menu | The camera to open. Filled by **List Devices** (Start lists automatically). `-- Select Device --` uses the first available device. The selection is kept across project loads, also while the device is unplugged (shown as *not found*). |
+| `Device Address` | String | Optional MXID or IP typed by hand — for a PoE camera on another subnet that discovery can't see. When filled in it overrides the `Device` menu. |
+| `List Devices` | Pulse | Enumerate all visible OAK devices and update the Device menu (parameter name `Refresh`). |
+| `Start` | Pulse | Look for devices, then start the pipeline. Does nothing while a pipeline is already running — Status says so. |
+| `Stop` | Pulse | Stop the pipeline and release the device. Also cancels a pending retry. |
+| `Rebuild` | Pulse | Stop and start again — applies changed settings (Device, Pipeline DAT, Tune page) to a running pipeline. |
+| `Status` | String (read-only) | What the component is doing: *Idle, Looking for devices, Waiting for the previous run to close, Opening device, Downloading models, Starting pipeline, Waiting for the first frame, Streaming, Closing device, Retrying in N s (attempt 2 of 3), Failed - press Start, Stopping, Stopped*. |
+| `Connected` | Toggle (read-only) | On while **frames are arriving**. Turns on with the first frame (not when the pipeline starts) and off when the run ends, stalls or fails. |
+| `Fps` | Int (read-only) | Measured frame rate, updated once per second; drops to 0 when frames stop. |
+| `Device Info` | String (read-only) | Model, platform and link of the connected device, e.g. `OAK-D-LITE \| RVC2 \| USB SUPER`. |
 | `Active Streams` | String (read-only) | Comma-separated list of active stream names. |
-| `Last Error` | String (read-only) | Most recent error message, or empty if no error. |
-| `Streams` (seq) | Sequential block | Bind stream names to Script Operators. Each block has a `Stream` menu, a `Scriptop` OP reference, and an optional `Handler` DAT reference (custom `parse`/`fill` — see [Script OP Integration](#script-op-integration)). |
+| `Last Error` | String (read-only) | Why the pipeline is **not running**, with the time it happened: a failed start, a lost device, a stall, a pipeline script error (`Type: message (DAT:line in function)`). Known depthai failures carry a hint. Kept until the next Start/Rebuild, so after an automatic reconnect it shows what the interruption was. `GetLastTraceback()` returns the full traceback. |
+| `Last Warning` | String (read-only) | Latest problem the pipeline **survived**, with its time: a Handler `parse`/`fill` that raised, a stream that went quiet, a USB2 link, a failed model pre-fetch, an undecodable message type. Each distinct warning is also printed once to the textport. Cleared on Start/Rebuild; handler warnings also on Reload Handlers. |
 | `Models` (seq) | Sequential block (read-only) | Status readout, one block per model the pipeline declares. `Model` is the slug or local path; `Progress` (0–1) tracks the pre-fetch. Populated automatically on Start — see [Model Pre-fetch](#model-pre-fetch). |
+
+**Pipeline page**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `Pipeline DAT` | DAT ref | Optional custom pipeline script. See [Pipeline Scripts](#pipeline-scripts). Leave empty for the built-in auto-detect pipeline. |
+| `Auto Reload` | Toggle | When enabled, the pipeline restarts when the Pipeline DAT changes (also after a failed build — fix the script and it starts again), and handler edits hot-reload. |
+| `Enable Depth` | Toggle | Built-in pipeline only: stereo depth output (ignored with a warning on devices without a CAM_B/CAM_C pair; ToF devices always stream depth). |
+| `Enable IMU` | Toggle | Built-in pipeline only: IMU output (ignored with a warning on devices without an IMU). |
+
+**Streams page**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `Streams` (seq) | Sequential block | Bind stream names to Script Operators. Each block has a `Stream` menu, a `Scriptop` OP reference, and an optional `Handler` DAT reference (custom `parse`/`fill` — see [Script OP Integration](#script-op-integration)). |
+| `Reload Handlers` | Pulse | Hot-reload the Streams blocks' Handler DATs (`parse`/`fill`) into the **running** pipeline — applies handler/binding edits without a restart. |
+
+**Tune page** — settings; all take effect on the next Start or Rebuild.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `First Frame Timeout` | Float | 15 | Seconds to wait for the first frame after the pipeline starts. If none arrives the run fails with an error (and `Reconnect` applies) instead of sitting at "started, no image". `0` = off. A pipeline script can override it with a module-level `FIRST_FRAME_TIMEOUT_S`. |
+| `Stall Timeout` | Float | 5 | Seconds without a frame on **any** stream before a running pipeline counts as stalled and the run fails. `0` = off. Script override: `STALL_TIMEOUT_S`. A single stream going quiet while others flow is a warning, not a failure. |
+| `Reconnect` | Menu | Limited | What to do when a run fails. `Off`: stay stopped. `Limited`: up to 3 start attempts in a row, then stop until Start. `Forever`: keep retrying, waiting 5, 10, 20, 40, then 60 s — for unattended installations. A run that streamed for 30 s counts as healthy and resets the count. |
+| `Auto Calibration` | Menu | Off | depthai's automatic stereo self-calibration (`Off` / `On Start` / `Continuous`), which depthai injects into any pipeline with `StereoDepth`. Default `Off`: on depthai 3.12.2 it crashes OAK-D Lite firmware ~2 s after start. A pipeline script can override it in `build()` with `pipeline.setAutoCalibrationMode()`. |
+| `Read Crash Dump` | Toggle | Off | On each connect, ask the device whether its firmware crashed during an earlier connection and put a one-line summary (error source, processor, crashed thread) into Last Warning. For diagnosing a pipeline that keeps dying with *MessageQueue was closed*. |
+| `Log Level` | Menu | Warn | depthai verbosity (`trace`…`critical`), applied to the device on Start. `warn` silences the periodic `[info]` chatter (temperatures, cpu usage). |
+
+**About page**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `Help` | Pulse | Open the TDOAK GitHub page. |
+| `Check for Update` | Pulse | Ask GitHub for the latest release and report it in `Update Status`. Check only, nothing is installed: TDOAK ships as a Python package, so updating means `pip install --upgrade git+https://github.com/TouchDesigner/TDOAK@v<version>` in the TouchDesigner venv, then restarting TouchDesigner (depthai is a native module and can't be reloaded in a running process). In a source checkout it suggests `git pull` instead. While the repo is private, set `TDOAK_GITHUB_TOKEN` in the environment. |
+| `Update Status` | String (read-only) | Result of the last update check. |
+| `Version` | String (read-only) | Version of the installed TDOAK package — the component's code *is* that package. |
+| `Depthai Version` | String (read-only) | depthai version loaded in this TouchDesigner process, with `(tested)` or a note when it is outside the range this TDOAK release was tested with; fills in on List Devices or Start. |
+| `.tox Save Build` | String (read-only) | TouchDesigner build the packaged `.tox` was last saved with — stamped at release, see [Releasing](#releasing). |
+
+### The TDOAKStream component
+
+`mod.TDOAK.toxPath('TDOAKStream')` — a Script TOP that shows one image stream. It pulls the frame inside its own cook, so there is nothing to wire up on the TDOAK component.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `OAK Component` | COMP | The TDOAK component to read from. |
+| `Stream` | String | Stream name (`rgb`, `depth`, `amplitude`, …). |
+| `Handler` | DAT | Optional Handler DAT whose `fill` shapes the frame — e.g. `depth_handler.py` to make a depth stream visible. |
+
+---
+
+## Troubleshooting
+
+Read **Status**, **Last Error** and **Last Warning** first — every failure path reports there. To see what depthai itself prints (device logs, unsupported-format messages), start TouchDesigner with the environment variable `TOUCH_TEXT_CONSOLE=1`.
+
+| Symptom | Likely cause | What to do |
+|---|---|---|
+| Last Error: *TDOAK package not importable* | The Python environment with TDOAK is not active in this project. | Quick Start step 1–2: environment in the project folder, active; reopen the project. |
+| Last Error: *No OAK device found* | Nothing visible on USB or the local subnet. | Cable, power, port. A PoE camera on another subnet: type its IP into **Device Address**. Close other programs that hold the camera (OAK Viewer, another TouchDesigner). |
+| Start does nothing | A pipeline is already running or closing — Status says which. | **Rebuild** to restart; or wait for *Waiting for the previous run to close*. |
+| Last Error: *no frames within N s of start* | The device accepted the pipeline but sends nothing: an unsupported stream configuration (e.g. an explicit frame type the camera doesn't support), or a device that crashed right after start. | Check the pipeline script; run with `TOUCH_TEXT_CONSOLE=1`. A slow pipeline can raise `First Frame Timeout` or set `FIRST_FRAME_TIMEOUT_S`. |
+| Last Error: *no frames for N s* / *pipeline stopped by itself* / *MessageQueue was closed* / *X_LINK_ERROR* | The device stalled or dropped off: power dip, cable, or a firmware crash. | USB3 cable and port, short and direct (or a powered hub) — **Device Info** shows the link speed and Last Warning flags USB2. With stereo depth keep `Auto Calibration` Off. Turn on `Read Crash Dump` and Rebuild to learn whether the firmware crashed. For installations set `Reconnect` to Forever. |
+| Device Info shows `USB HIGH` | USB2 link (cable or port). | Use a USB3 cable and port; high-resolution or multi-stream pipelines will not fit through USB2. |
+| A depth / disparity TOP looks black | The data is fine: 16-bit millimetres (0–65535 scale) shown as-is are dark. | Use `depth_handler.py` (Handler on the stream, or on a TDOAKStream), or a Math/Level TOP. |
+| Last Warning: *fill[...]* / *parse[...]* | A Handler DAT raised. | Fix the DAT; with Auto Reload the warning clears on the next successful reload. |
+| Last Warning: *download[model]: …* | The model pre-fetch subprocess failed; the reason is in the message. The model is then fetched in-process (works, but the UI can hitch). On macOS a stand-alone Python cannot load depthai from TouchDesigner's environment at all, so this warning is expected there. | Usually nothing. Offline: download once while online; the cache is `.depthai_cached_models/` in the project folder. |
+| Last Warning: *depthai host-node workaround active* | Informational. In TouchDesigner 2025.33230 with depthai 3.12.2, depthai drops Python host nodes (everything from depthai-nodes); TDOAK keeps them alive. | Nothing. |
+| Last Warning: *no built-in decoder for … messages* | The stream carries a message type TDOAK doesn't decode. | Attach a Handler DAT with a `parse(msg)`. |
+| Colours of a stream look swapped (after upgrading) | Since 0.1.4 every colour stream is delivered as RGB, not only the one named `rgb`. | Remove channel swaps you added in your own handlers. |
+
+The full Python traceback of the last failed run: `op('TDOAK').GetLastTraceback()`. The Thread Manager's log (Palette → TDResources → threadManager → logger) has the worker-side messages.
 
 ---
 
@@ -75,13 +149,18 @@ All methods listed here are safe to call from the **main thread** unless otherwi
 ### Lifecycle
 
 #### `Start() -> None`
-Start the camera pipeline. Resets the retry counter to zero (so errors before this call are forgotten). If the pipeline fails, it retries up to 3 times with a 10-second delay between attempts. After 3 failures, `Lasterror` shows the final error and the pipeline stops retrying — call `Start()` again to reset.
+Start the camera pipeline; clears `Lasterror`/`Lastwarning` and starts a fresh failure count with the current `Reconnect` setting. A no-op (reported in `Status`) while a pipeline is already running — use `Rebuild()`. If a run fails, the `Reconnect` policy decides: `off` stays stopped; `limited` allows 3 start attempts in a row (5 s, then 10 s apart) before `Lasterror` shows the final error; `forever` keeps retrying with backoff up to 60 s. A run that streamed for 30 s resets the count.
+
+#### `StartFromUi() -> None`
+What the **Start** pulse does: enumerate devices first, report *No OAK device found* when there is none (and no explicit device is selected), otherwise `Start()`.
 
 #### `Stop() -> None`
 Signal the background pump to exit cleanly. The pipeline and device are closed **on the background thread** (the pump's `finally`), not in a main-thread hook — `device.close()`/`pipeline.stop()` are blocking depthai calls, so keeping them off the main thread avoids freezing the UI for several frames on each stop or retry.
 
 #### `Rebuild() -> None`
-Stop the pipeline and restart it after 5 frames. Equivalent to `Stop()` followed by a delayed `Start()`. Triggered automatically when `Auto Reload` is on and the Pipeline DAT changes.
+Stop the pipeline and restart it once the device has closed. The way to apply changed settings to a running pipeline. Triggered automatically when `Auto Reload` is on and the Pipeline DAT changes — also after a failed build, when no pipeline is running.
+
+**Re-initializing the extension** (the *Re-Init Extensions* pulse, or TouchDesigner doing it) while a pipeline runs behaves like `Rebuild`: the old run is stopped and a new one starts under the new instance.
 
 #### `ReloadHandlers() -> None`
 Re-load the Streams blocks' Handler DATs and hot-swap their `parse`/`fill` into the **running** pipeline — no device or pipeline restart. Call after adding or editing a Streams block, its `Scriptop`, or its `Handler` DAT. The worker reads the new `parse` on its next message; the main thread picks up the new `fill` on the next cook. Adding a brand-new **physical stream** still needs a `Rebuild()` (that's a `build()` change). Safe to call while stopped — it just primes state for the next Start. Triggered automatically when `Auto Reload` is on and a Streams block/binding/Handler changes, or manually via the `Reload Handlers` pulse.
@@ -91,7 +170,7 @@ Re-load the Streams blocks' Handler DATs and hot-swap their `parse`/`fill` into 
 ### Device Discovery
 
 #### `ListDevices(callback=None) -> None`
-Enumerate all visible OAK devices in a background thread and update the `Device` parameter menu. Optionally accepts a callback that receives the device list when enumeration completes.
+Enumerate all visible OAK devices in a background thread and update the `Device` parameter menu. Optionally accepts a callback that receives the device list when enumeration completes. While a device is booting or closing, no scan is made and the last known list is served.
 
 ```python
 def on_devices(devices):
@@ -141,7 +220,7 @@ Return the stream names for which at least one frame has been received.
 #### Convenience getters
 
 ```python
-oak.GetRgb()      # → ndarray (H, W, 3) uint8 BGR, or None
+oak.GetRgb()      # → ndarray (H, W, 3) uint8 RGB, or None
 oak.GetDepth()    # → ndarray (H, W) uint16, or None
 oak.GetIrLeft()   # → ndarray (H, W) uint8, or None
 oak.GetIrRight()  # → ndarray (H, W) uint8, or None
@@ -153,10 +232,10 @@ oak.GetPose()     # → list[PoseEntry], or None
 
 | Stream | dtype | Shape | Notes |
 |---|---|---|---|
-| `rgb` | `uint8` | `(H, W, 3)` | BGR channel order, vertically flipped to TD convention |
-| `depth` | `uint16` | `(H, W)` | Millimetres |
+| `rgb` | `uint8` | `(H, W, 3)` | RGB channel order, vertically flipped to TD convention |
+| `depth` | `uint16` | `(H, W)` | Millimetres. Shown raw in a TOP it looks nearly black — see `depth_handler.py` |
 | `amplitude` | `uint16` | `(H, W)` | ToF amplitude (signal strength) |
-| `color` | `uint8` | `(H, W, 3)` | BGR, aligned to ToF depth perspective |
+| `color` | `uint8` | `(H, W, 3)` | RGB, aligned to ToF depth perspective |
 | `ir_left` / `ir_right` | `uint8` | `(H, W)` | Rectified infrared frames |
 | `pointcloud` | `float32` | `(H, W, 3)` | Organized XYZ in mm (R=X, G=Y, B=Z) — drops into a 32-bit float TOP |
 | `segmentation` | `uint16` | `(H, W)` | depthai-nodes `SegmentationMask` class indices (background → 0), flipped to TD convention — drops into a TOP |
@@ -166,7 +245,7 @@ oak.GetPose()     # → list[PoseEntry], or None
 
 > The `depth` stream is `uint16` millimetres for the stereo and ToF pipelines, but `float32` **relative** inverse depth (`[0,1]`, larger = nearer) for `mono_depth_pipeline.py`, since that comes from a neural `Map2D` rather than a metric sensor.
 
-> Stream names above are conventions, not requirements — `GetFrame(name)` keys off whatever names your pipeline's `build()` returns. The dtype/shape is determined by the decoded message type, not the name.
+> Stream names above are conventions, not requirements — `GetFrame(name)` keys off whatever names your pipeline's `build()` returns. The dtype/shape is determined by the decoded message type, not the name. Every colour image is RGB and every image is bottom-up (TouchDesigner's convention), whatever the stream is called.
 
 **`DetectionEntry` fields:**
 
@@ -175,6 +254,7 @@ oak.GetPose()     # → list[PoseEntry], or None
 | `label` | `int` |
 | `confidence` | `float` (0–1) |
 | `xmin` / `ymin` / `xmax` / `ymax` | `float` (0–1, normalised) |
+| `x` / `y` / `z` | `float`, millimetres in camera space — only for spatial detections (`dai.SpatialImgDetections`) |
 
 **`PoseEntry` fields** (one per detected person):
 
@@ -210,8 +290,9 @@ oak.GetPose()     # → list[PoseEntry], or None
 
 | Key | Type | Description |
 |---|---|---|
-| `accel` | `list[float]` | `[x, y, z]` m/s² |
-| `gyro` | `list[float]` | `[x, y, z]` rad/s |
+| `accel` | `list[float]` | Latest reading, `[x, y, z]` m/s² |
+| `gyro` | `list[float]` | Latest reading, `[x, y, z]` rad/s |
+| `samples` | `list[list[float]]` | Every packet of the message, oldest first: `[ax, ay, az, gx, gy, gz, t]` (`t` = device timestamp in seconds). The IMU reports faster than TouchDesigner cooks — use this when you need all of it. |
 
 ---
 
@@ -261,7 +342,7 @@ Pipeline nodes expose named input queues that accept depthai message objects. Th
 `InputQueue.send()` is thread-safe; `SendControl` may be called from TD's main thread, an Execute DAT, or a panel callback without coordination.
 
 #### `SendControl(name: str, message: object) -> bool`
-Send a depthai control or config message to the named input queue. Returns `True` on success, `False` if the queue name is not registered for the active pipeline (e.g. the pipeline is not running, or that control was not declared by the pipeline script).
+Send a depthai control or config message to the named input queue. Returns `True` on success, `False` if the queue name is not registered for the active pipeline (e.g. the pipeline is not running, or that control was not declared by the pipeline script). A send that raises returns `False` and reports `control[name]: …` in `Lastwarning`.
 
 ```python
 import depthai as dai
@@ -370,6 +451,10 @@ Script POPs, TOPs, CHOPs, and DATs support *Modify Outside of Cook*, so the exte
 | Script **POP** | pushed — your `fill` (staging API works outside the cook) | No |
 | Script **SOP** | pulled — your `fill` runs *inside* the cook | Yes — `FillScriptOp(me)` |
 
+For a plain image stream the ready-made **TDOAKStream** component (see [Component Parameters](#the-tdoakstream-component)) is the shortest path: it is a Script TOP that pulls with `FillScriptOp(scriptOp, stream=…)`.
+
+> **Pushing into a Script TOP of your own:** a new Script TOP's default `onCook` writes a small noise image, which overwrites the pushed frame whenever the TOP cooks. Empty that `onCook` (leave only `return`), or use the pull form below instead. `Modify Outside of Cook` is switched on for you.
+
 For a Script SOP, add a one-line cook callback:
 
 ```python
@@ -470,11 +555,17 @@ Return a snapshot of the current pipeline state.
 
 | Key | Type | Description |
 |---|---|---|
-| `connected` | `bool` | Whether the pipeline is running. |
+| `connected` | `bool` | Whether frames are arriving. |
 | `fps` | `float` | Measured frame rate (updated once per second, driven by the `rgb` stream). |
 | `latency_ms` | `float` | Frame latency in milliseconds (device timestamp vs host receipt). |
-| `error` | `str` | Last error message, or empty string. |
+| `error` | `str` | Why the pipeline is not running, or empty string. |
+| `warning` | `str` | Latest problem the pipeline survived, or empty string. |
 | `streams` | `list[str]` | Active stream names. |
+| `status` | `str` | Lifecycle text, same as the `Status` parameter. |
+| `stream_age` | `dict[str, float]` | Seconds since each stream's last message (updated about once a second). |
+
+#### `GetLastTraceback() -> str`
+Full Python traceback of the last failed run — the detail behind the one-line `Lasterror`.
 
 ---
 
@@ -499,6 +590,24 @@ The third element is optional — returning a 2-tuple is also accepted (no contr
 - **Output queues:** keys become the stream names available via `GetFrame(name)`.
 - **Stream names:** the ordered list used to populate the `Stream` menus on sequential blocks.
 - **Control queues:** keys become the names accepted by `SendControl(name, msg)`. Create these with `node.someInput.createInputQueue(maxSize=1, blocking=False)`.
+
+In scope for the script: `dai`, and `PROJECT_FOLDER` (the folder of the .toe, as a string). The script runs on the worker thread — TouchDesigner objects (`op`, `project`, `me`) are **not** available in it.
+
+Optional extras a script may define:
+
+```python
+FIRST_FRAME_TIMEOUT_S = 30   # override the Tune page's First Frame Timeout for this pipeline
+STALL_TIMEOUT_S       = 0    # ... and the Stall Timeout (0 = off: a pipeline that only answers
+                             #     frames you send it is silent by design)
+
+def started(pipeline, device):
+    # Called on the worker right after pipeline.start(), for device calls that need a
+    # running pipeline - e.g. the IR emitters of an OAK-D Pro:
+    device.setIrLaserDotProjectorIntensity(0.5)
+    device.setIrFloodLightIntensity(0.0)
+```
+
+Don't request an explicit frame type in `requestOutput()` unless you know the camera supports it (`cam.requestOutput((1280, 720))`, no `type=`): an unsupported type leaves the pipeline running without frames, which the First Frame Timeout then reports.
 
 ### Minimal example
 
@@ -535,7 +644,7 @@ Each entry is classified automatically:
 
 After a successful pre-fetch of a zoo slug, the in-process `build()` runs with `DEPTHAI_ZOO_INTERNET_CHECK=0` so it loads the cached archive instead of repeating the online check. An all-local pipeline leaves the check on, so any incidental zoo resolve still works.
 
-The subprocess uses the project's **`.venv` interpreter** (`/.venv/Scripts/python.exe`, falling back to TD's Python); that environment must have `depthai` installed.
+The subprocess uses the interpreter of the **virtual environment depthai was loaded from** (wherever it is), falling back to `<project folder>/.venv`. If neither exists, or the subprocess fails, `Lastwarning` says why and the model is resolved in-process by `build()` instead — it still works, but the download can freeze the UI. On macOS a stand-alone Python can't load depthai from an environment created by TouchDesigner (code-signing), so there the in-process path is the normal one.
 
 > Declaring `MODELS` is optional. With none declared, `build()` resolves models itself inline — simplest, but that's the path that briefly hangs the UI.
 
@@ -550,7 +659,7 @@ def build(pipeline):
     import depthai as dai
     from depthai_nodes.node import ParsingNeuralNetwork
     cam     = pipeline.create(dai.node.Camera).build()
-    archive = dai.NNArchive(f'{project.folder}/models/mymodel.tar.xz')
+    archive = dai.NNArchive(f'{PROJECT_FOLDER}/models/mymodel.tar.xz')
     nn      = pipeline.create(ParsingNeuralNetwork).build(cam, archive)
     return ({'rgb': nn.passthrough.createOutputQueue(maxSize=1, blocking=False),
              'out': nn.out.createOutputQueue(maxSize=1, blocking=False)},
@@ -584,7 +693,8 @@ All paths relative to `src/TDOAK/examples/` (resolve at runtime with `mod.TDOAK.
 |---|---|---|
 | `pointcloud_handler.py` | `depth` | fill-only — reprojects the depth map through the device calibration (`GetIntrinsics`) into a metric point cloud in a Script **POP**. Pairs with `pipeline.py`. |
 | `face_handler.py` | `faces` | fill-only — draws the detected face landmark points into a Script **POP**. |
-| `hand_handler.py` | `hands` | `parse` + `fill` — decodes the GatheredData message, back-maps each hand's crop-local keypoints onto the full frame, and draws 21-point skeletons into a Script **SOP**. Required by `hand_pipeline.py`. |
+| `hand_handler.py` | `hands` | `parse` + `fill` — decodes the GatheredData message, back-maps each hand's crop-local keypoints onto the full frame, and draws 21-point skeletons into a Script **POP** (pushed, no cook callback). Required by `hand_pipeline.py`. |
+| `depth_handler.py` | `depth` | fill-only — turns the 16-bit millimetre depth image into a 32-bit float image for a Script **TOP**: metres, or 0–1 across a display range (near = white). Also for disparity streams. |
 | `classification_handler.py` | `classes` | fill-only — writes the top results into a Table **DAT** (`label \| score` rows, sorted). |
 | `segmentation_handler.py` | `segmentation` | fill-only — shapes the class mask into silhouette points in a Script **POP**. |
 | `pose_handler.py`, `skeleton_handler.py` | — | blank `parse`/`fill` templates to start a custom Handler from. |
@@ -604,15 +714,60 @@ The background thread **must not access any TD objects** (`op()`, `me`, `run()`,
 
 ---
 
+## Development
+
+The extension code lives in the package, not in the `.tox`:
+
+| Where | What |
+|---|---|
+| `src/TDOAK/ext/OAKManagerExt.py`, `CameraControlExt.py` | The extension classes. Each component's extension DAT is a few-line shim calling `TDOAK.ext.create('<Class>', me)`. |
+| `src/TDOAK/core/` | Pure-Python logic without TouchDesigner or depthai imports: lifecycle state, frame watchdog, retry policy, error channel, decoders, pipeline-script scan, interpreter lookup, version checks. |
+| `tests/` | `pytest` unit tests for `core` and the `ext` loader, plus static checks of the example scripts. |
+
+Run the tests from the repo root with any Python that has `pytest` and `numpy` (no TouchDesigner, no depthai, no camera needed):
+
+```
+python -m pytest
+```
+
+To pick up an edit to `core/` or `ext/` in a running TouchDesigner, pulse **Re-Init Extensions** on the component: changed modules are reloaded, and a running pipeline is restarted. Editing the files alone changes nothing until then.
+
+---
+
 ## Releasing
 
-The package version lives in one place: `__version__` in `src/TDOAK/__init__.py` (`pyproject.toml` reads it dynamically). To publish a release:
+The package version lives in one place: `__version__` in `src/TDOAK/__init__.py` (`pyproject.toml` reads it dynamically). The depthai range a release is tested with is the pin in `pyproject.toml` **and** `TESTED_DEPTHAI` in `src/TDOAK/core/compat.py` (a test keeps them in step).
 
-1. Bump `__version__` (e.g. `"0.1.2"`), commit, push.
-2. Tag and push the tag:
+1. Run `python -m pytest`.
+2. Run the **hardware checklist** below.
+3. If a `.tox` changed (parameters, the parexec, a shim — *not* extension code, which is in the package), save it with neutral values: `Device` on `-- Select Device --`, empty `Device Address`/`Pipeline DAT`, one empty `Streams` block, Tune page at defaults, and stamp the About page first so **.tox Save Build** names the build that saved it:
+     ```python
+     op('TDOAK').par.Toxsavebuild = app.build
+     ```
+   A `.tox` doesn't record its save build anywhere TouchDesigner can read back, so this field is a stamp, not a live value. **Version** and **Depthai Version** fill themselves at runtime from the installed packages.
+   Careful when adding parameters to the **Device** page: a parameter appended after the `Models` sequence corrupts the sequence. Remove the sequence, add and sort the parameters, then re-create it (`appendSequence('Models')`, parameters `Model` and `Progress`, `seq.blockSize = 2`).
+4. Bump `__version__` (e.g. `"0.1.4"`), commit, push.
+5. Tag and push the tag:
    ```
-   git tag v0.1.2
-   git push origin v0.1.2
+   git tag v0.1.4
+   git push origin v0.1.4
    ```
 
-The `Release` GitHub workflow triggers on `v*` tags, verifies the tag matches `__version__` (mismatch fails the run), builds sdist + wheel, and publishes them to a GitHub Release with generated notes. CI (`ci.yml`) additionally builds and smoke-tests the wheel on every push.
+The `Release` GitHub workflow triggers on `v*` tags, verifies the tag matches `__version__` (mismatch fails the run), runs the tests, builds sdist + wheel, and publishes them to a GitHub Release with generated notes. CI (`ci.yml`) runs the tests on Linux, macOS and Windows and smoke-tests the built wheel on every push.
+
+### Hardware checklist
+
+Run on at least one USB camera and one PoE camera before a release (about 20 minutes).
+
+1. Blank project, Quick Start followed literally: the image appears in TDOAKStream.
+2. Start, Stop, Start ten times: no crash; Status reads correctly each time.
+3. Rebuild five times while streaming.
+4. Pull the USB cable (or the Ethernet link) mid-stream: an error within the Stall Timeout. With `Reconnect` = Forever: recovery after replugging.
+5. Start with no camera attached: *No OAK device found*.
+6. Pulse Re-Init Extensions while streaming, and edit the Pipeline DAT while streaming (Auto Reload on): a clean restart each time.
+7. Stereo depth with `Auto Calibration` Off: runs for 5 minutes. On a ToF camera: `tof_showcase_pipeline.py`, depth and amplitude.
+8. One model pipeline (e.g. `yolo_pipeline.py`) with an empty model cache: it starts, detections arrive.
+9. Break and fix a Handler DAT, break and fix the Pipeline DAT: Last Warning / Last Error report it, and the fixed version runs without pressing Start.
+10. Quit TouchDesigner while streaming: a clean exit.
+11. Thirty-minute soak: Fps steady, Status *Streaming*.
+12. On a USB2 cable: Device Info shows the link speed and Last Warning flags it.

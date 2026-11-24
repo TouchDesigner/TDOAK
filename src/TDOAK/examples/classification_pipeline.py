@@ -8,7 +8,7 @@ from __future__ import annotations
 # model archive — no label table needed on the host).
 #
 # Streams:
-#   'rgb'     — BGR passthrough: the exact 224×224 frame inference ran on.
+#   'rgb'     — passthrough (RGB on the host): the exact 224×224 frame inference ran on.
 #   'classes' — a depthai-nodes Classifications message. The host's built-in decoder
 #               turns it into ClassificationEntry dicts [{label: str, score: float}, …],
 #               sorted by score. classification_handler.py is a fill-only Handler

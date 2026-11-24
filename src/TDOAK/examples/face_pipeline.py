@@ -7,7 +7,7 @@ from __future__ import annotations
 # ImgDetectionsExtended messages carrying keypoints).
 #
 # Streams:
-#   'rgb'   — BGR passthrough: the exact 640×480 frame inference ran on, 1:1 with the
+#   'rgb'   — passthrough (RGB on the host): the exact 640×480 frame inference ran on, 1:1 with the
 #             coordinates below.
 #   'faces' — a dai.ImgDetections whose detections carry keypoints (YuNet's parser uses
 #             the same message shape as the pose models), so the host's built-in decoder

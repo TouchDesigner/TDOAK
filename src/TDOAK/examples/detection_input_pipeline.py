@@ -34,6 +34,12 @@ NN_INPUT: tuple[int, int] = (512, 288)
 # Declared so the host pre-fetches the model on a subprocess before the build runs.
 MODELS: list[str] = [MODEL]
 
+# This pipeline only answers frames the host sends: with the feeder off it is silent by
+# design. Switch the component's frame watchdog off for it (0 = no timeout), or the
+# Tune page's First Frame / Stall timeouts would report the silence as a dead device.
+FIRST_FRAME_TIMEOUT_S = 0
+STALL_TIMEOUT_S = 0
+
 
 def build(pipeline: dai.Pipeline) -> tuple[
     dict[str, dai.DataOutputQueue],

@@ -7,7 +7,7 @@ from __future__ import annotations
 # SegmentationParser emits SegmentationMask messages).
 #
 # Streams:
-#   'rgb'          — BGR passthrough: the exact 256×256 frame inference ran on, 1:1
+#   'rgb'          — passthrough (RGB on the host): the exact 256×256 frame inference ran on, 1:1
 #                    with the mask below.
 #   'segmentation' — a depthai-nodes SegmentationMask. The host's built-in decoder turns
 #                    it into a uint16 (H, W) class-index map (0 = background, flipped to

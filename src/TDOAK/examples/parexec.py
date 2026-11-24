@@ -1,5 +1,9 @@
-# parExec DAT — attached to OAK Base COMP
-# Routes parameter value changes and pulses to extension methods.
+# Parameter Execute DAT of the OAK component (this is the text of parexec1 inside
+# TDOAK.tox - kept here for reference).
+#
+# Routes every custom pulse to the extension method OnPulse<Parname>, so a new pulse
+# parameter only needs a matching method in OAKManagerExt - this DAT never changes.
+# DAT settings: OP = the component, Parameters = *, Custom on, Built-In off, On Pulse on.
 
 from __future__ import annotations
 
@@ -9,13 +13,7 @@ if TYPE_CHECKING:
     from td import Par
 
 
-def onValueChange(par: Par, prev: object) -> None:
-    fn = getattr(parent(), 'OnValueChange' + par.name, None)
-    if fn:
-        fn(par, prev)
-
-
 def onPulse(par: Par) -> None:
-    fn = getattr(parent(), 'OnPulse' + par.name, None)
-    if fn:
+    fn = getattr(parent.TDOAK, 'OnPulse' + par.name, None)
+    if fn is not None:
         fn(par)

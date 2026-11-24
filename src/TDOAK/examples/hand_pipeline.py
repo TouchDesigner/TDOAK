@@ -26,7 +26,7 @@ from __future__ import annotations
 #             decoders, so bind this stream to a Streams block whose Handler points at
 #             hand_handler.py — its parse() back-maps each hand's crop-local
 #             keypoints onto the full frame using the palm's rotated rect, and fill()
-#             draws the 21-point skeleton into a Script SOP.
+#             draws the 21-point skeleton into a Script POP.
 #
 # OAK-D is an RVC2 device → the :192x192 / :224x224 variants below are the RVC2 builds.
 # For an OAK4 (RVC4) swap to the matching RVC4 variants.

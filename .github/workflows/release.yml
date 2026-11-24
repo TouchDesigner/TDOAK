@@ -27,6 +27,12 @@ jobs:
             exit 1
           fi
 
+      - name: Run tests
+        run: |
+          python -m pip install --no-deps -e .
+          python -m pip install pytest numpy
+          python -m pytest -q
+
       - name: Build sdist and wheel
         run: |
           python -m pip install --upgrade build

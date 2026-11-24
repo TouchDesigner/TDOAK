@@ -11,7 +11,7 @@
 # RVC4-only and won't run on these devices.
 #
 # Streams:
-#   'rgb'   — BGR passthrough: the exact frame inference ran on (384x256), so the depth
+#   'rgb'   — passthrough (RGB on the host): the exact frame inference ran on (384x256), so the depth
 #             map below is pixel-aligned with it.
 #   'depth' — a depthai_nodes Map2D message. OAKManagerExt's built-in Map2D decoder turns
 #             it into a float32 (H, W) array, so a Script TOP bound to 'depth' fills

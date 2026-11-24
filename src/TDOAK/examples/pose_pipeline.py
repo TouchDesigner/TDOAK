@@ -9,7 +9,7 @@ from __future__ import annotations
 #   message — no hand-written tensor decoding needed.
 #
 # Streams:
-#   'rgb'  — BGR passthrough frames: the exact letterboxed frame inference ran on,
+#   'rgb'  — passthrough frames (RGB on the host): the exact letterboxed frame inference ran on,
 #            so the normalized keypoints below map straight onto it (1:1).
 #   'pose' — a dai.ImgDetections message; one detection per person, each carrying:
 #              .confidence          float

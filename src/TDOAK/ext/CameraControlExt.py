@@ -1,10 +1,13 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
-# camera_control.py — CameraControlExt for the OAKCameraControl component.
+# CameraControlExt — extension of the OAKCameraControl component (TDOAKCamCtl.tox).
 # Builds dai.CameraControl messages from the component's custom parameters and sends
 # them into a running OAK pipeline's control input queue (OAKManagerExt.SendControl).
 # Runs entirely on TD's main thread: constructing a CameraControl is pure message
 # assembly and input-queue send() is non-blocking (maxSize=1) and thread-safe.
+#
+# Like OAKManagerExt this is a package module; the component's extension DAT is a shim
+# calling TDOAK.ext.create('CameraControlExt', me).
 
 from typing import TYPE_CHECKING
 

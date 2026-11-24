@@ -1,13 +1,14 @@
 # hand_handler.py — Handler DAT for the 'hands' stream of hand_pipeline.py
-# Point a Streams block's Handler parameter at this DAT, bind its Scriptop to a Script SOP,
-# and add the onCook callback below to that SOP. `dai` and `np` are already in scope.
+# Point a Streams block's Handler parameter at this DAT and bind its Scriptop to a
+# Script POP. `dai`, `np` and `oak` are already in scope.
 #
 #   parse(msg)             BACKGROUND THREAD — depthai GatheredData -> plain per-hand data.
-#   fill(scriptOp, hands)  MAIN THREAD      — draws each hand's landmark skeleton into a Script SOP.
+#   fill(scriptOp, hands)  MAIN THREAD      — draws each hand's landmark skeleton (points +
+#                                             line primitives) into the Script POP.
 #
-# Script SOP cook callback (paste into the bound SOP's Callbacks DAT):
-#   def onCook(scriptOp):
-#       op('OAK').ext.OAKManagerExt.FillScriptOp(scriptOp)
+# Script POPs are pushed directly on each new frame (the POP staging API works outside the
+# cook), so the POP needs NO cook callback. This fill uses that staging API
+# (createGeometryStagingData / buildGeometry) — it does not work on a Script SOP.
 
 import math
 
@@ -89,7 +90,7 @@ def parse(msg) -> list[dict]:
 
 
 def fill(scriptOp, hands) -> None:
-    """MAIN THREAD — full TD access, runs inside the operator's cook.
+    """MAIN THREAD — full TD access. scriptOp: the bound Script POP.
     hands: the list of per-hand dicts produced by parse() above."""
     stagingData = scriptOp.createGeometryStagingData()
 

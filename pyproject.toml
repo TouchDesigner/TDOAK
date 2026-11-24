@@ -14,10 +14,13 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
 ]
+# depthai is pinned to the minor series that went through the hardware checklist: 3.x minors
+# have shipped device-firmware and API regressions. Widen the range (and TESTED_DEPTHAI in
+# src/TDOAK/core/compat.py — a test keeps the two in step) after testing a new series.
 dependencies = [
-  "depthai>=3.8",
-  "depthai-nodes",  # ParsingNeuralNetwork + parsers for Model Zoo NNs (pose_pipeline)
-  "numpy",
+  "depthai>=3.12,<3.13",
+  "depthai-nodes>=0.8,<0.9",  # ParsingNeuralNetwork + parsers for Model Zoo NNs (pose_pipeline)
+  "numpy",                    # TouchDesigner supplies its own numpy at runtime
 ]
 
 [project.urls]
@@ -41,8 +44,6 @@ version = {attr = "TDOAK.__version__"}
 [tool.setuptools.package-data]
 TDOAK = [
   "*.tox",
-  "td/*",
-  "td/**/*",
   "examples/*",
   "examples/**/*",
   "assets/*",
@@ -56,10 +57,13 @@ TDOAK = [
 where = ["src"]
 include = ["TDOAK*"]
 exclude = [
-  "TDOAK.td", "TDOAK.td.*",
   "TDOAK.examples", "TDOAK.examples.*",
   "*.__pycache__", "*.__pycache__.*",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
 
 [tool.touchdesigner]
 requiresTouchDesigner = "2025.33070"

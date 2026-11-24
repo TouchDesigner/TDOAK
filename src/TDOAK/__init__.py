@@ -14,12 +14,13 @@ __all__ = [
     'toxPaths',
 ]
 
-__version__ = "0.1.3"
+__version__ = "0.2.0"
 __td_requires_touchdesigner__ = "2025.33070"
 __td_package_type__ = ""
 __td_collection__ = {
     "TDOAK": Path(str(resources.files(__package__) / "TDOAK.tox")),
     "TDOAKCamCtl": Path(str(resources.files(__package__) / "TDOAKCamCtl.tox")),
+    "TDOAKStream": Path(str(resources.files(__package__) / "TDOAKStream.tox")),
 }
 
 
